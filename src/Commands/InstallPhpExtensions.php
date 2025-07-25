@@ -401,10 +401,6 @@ class InstallPhpExtensions extends Command
         $this->info('Ensuring git-based dependencies are available...');
         $this->ensureGitDependencies($spcPath);
 
-        // CRITICAL: Ensure tar-based extractions are complete (especially nghttp2)
-        $this->info('Verifying tar-based extractions...');
-        $this->ensureTarBasedExtractions($spcPath);
-
         // Download required extension sources
         foreach ($this->selectedExtensions as $ext) {
             // Skip basic extensions that don't need separate downloads
@@ -469,6 +465,10 @@ class InstallPhpExtensions extends Command
                 }
             }
         }
+
+        // CRITICAL: Ensure tar-based extractions are complete AFTER downloading libraries
+        $this->info('Verifying tar-based extractions...');
+        $this->ensureTarBasedExtractions($spcPath);
     }
 
     protected function cleanBuildArtifacts(string $spcPath): void
@@ -576,7 +576,7 @@ class InstallPhpExtensions extends Command
         $this->info("Building with selected extensions: {$extensions}");
 
         // Build command without --with-php (that's used in download phase)
-        $buildCmd = "php bin/spc build \"{$extensions}\" --build-cli";
+        $buildCmd = "php bin/spc build \"{$extensions}\" --build-cli --debug";
         $this->line("Running build command: {$buildCmd}");
 
         $buildProcess = Process::path($spcPath)
@@ -1113,12 +1113,34 @@ class InstallPhpExtensions extends Command
                 $contents = scandir($targetPath);
                 $realContents = array_diff($contents, ['.', '..']);
 
+                $isIncomplete = false;
+
                 // If directory only contains .spc-hash and build/, it's incomplete
                 if (
                     count($realContents) <= 2 &&
                     (in_array('.spc-hash', $realContents) || in_array('build', $realContents))
                 ) {
+                    $isIncomplete = true;
+                }
 
+                // Check for essential files based on dependency type
+                if (!$isIncomplete) {
+                    $expectedFiles = $this->getExpectedFilesForDependency($depName);
+                    if (!empty($expectedFiles)) {
+                        $missingFiles = [];
+                        foreach ($expectedFiles as $expectedFile) {
+                            if (!in_array($expectedFile, $realContents) && !file_exists($targetPath . '/' . $expectedFile)) {
+                                $missingFiles[] = $expectedFile;
+                            }
+                        }
+                        if (!empty($missingFiles)) {
+                            $this->warn("Missing essential files for {$depName}: " . implode(', ', $missingFiles));
+                            $isIncomplete = true;
+                        }
+                    }
+                }
+
+                if ($isIncomplete) {
                     $this->warn("Detected incomplete extraction for {$depName}, re-extracting...");
                     $this->reExtractTarDependency($downloadsPath, $sourcePath, $depName);
                 }
@@ -1148,7 +1170,12 @@ class InstallPhpExtensions extends Command
         ];
 
         // Special patterns for some dependencies
-        if ($depName === 'libjpeg') {
+        if ($depName === 'sqlite') {
+            $possibleArchives = array_merge($possibleArchives, [
+                'sqlite-autoconf*.tar.gz',
+                'sqlite-autoconf*.tar.xz'
+            ]);
+        } elseif ($depName === 'libjpeg') {
             $possibleArchives = array_merge($possibleArchives, [
                 'libjpeg-turbo*.tar.gz',
                 'libjpeg-turbo*.tar.xz'
@@ -1162,6 +1189,7 @@ class InstallPhpExtensions extends Command
         } elseif ($depName === 'libxml2') {
             $possibleArchives = array_merge($possibleArchives, [
                 'v*.tar.gz',  // libxml2 uses v2.12.5.tar.gz pattern
+                'libxml2-v*.tar.gz',
                 'libxml2-*.tar.gz',
                 'libxml2-*.tar.xz'
             ]);
@@ -1172,7 +1200,29 @@ class InstallPhpExtensions extends Command
             $matches = glob($downloadsPath . '/' . $pattern);
             if (!empty($matches)) {
                 $archiveFile = $matches[0]; // Use the first match
+                $this->info("  - Found archive: " . basename($archiveFile) . " using pattern: {$pattern}");
                 break;
+            }
+        }
+
+        // Special handling for dependencies with version-only names
+        if (!$archiveFile) {
+            // Check for version-only archives (like v1.3.2.tar.gz for libwebp, v2.12.5.tar.gz for libxml2)
+            $versionArchives = glob($downloadsPath . '/v*.tar.gz');
+            if (!empty($versionArchives)) {
+                // Try to match based on common version patterns
+                foreach ($versionArchives as $versionArchive) {
+                    $basename = basename($versionArchive);
+                    if ($depName === 'libwebp' && preg_match('/^v1\.\d+\.\d+\.tar\.gz$/', $basename)) {
+                        $archiveFile = $versionArchive;
+                        $this->info("  - Found libwebp archive: {$basename}");
+                        break;
+                    } elseif ($depName === 'libxml2' && preg_match('/^v2\.\d+\.\d+\.tar\.gz$/', $basename)) {
+                        $archiveFile = $versionArchive;
+                        $this->info("  - Found libxml2 archive: {$basename}");
+                        break;
+                    }
+                }
             }
         }
 
@@ -1183,12 +1233,21 @@ class InstallPhpExtensions extends Command
 
         $this->info("  - Extracting {$depName} from " . basename($archiveFile));
 
-        // Use appropriate extraction command based on file extension
+        // Create target directory first
+        if (!file_exists($targetPath)) {
+            mkdir($targetPath, 0755, true);
+        }
+
+        // Convert Windows paths to avoid tar issues with drive letters
+        $winArchiveFile = str_replace('\\', '/', $archiveFile);
+        $winTargetPath = str_replace('\\', '/', $targetPath);
+
+        // Use appropriate extraction command based on file extension with Windows-compatible paths
         $extractCmd = '';
         if (str_ends_with($archiveFile, '.tar.xz')) {
-            $extractCmd = "tar -xf \"{$archiveFile}\" --strip-components=1 -C . --one-top-level={$depName} --no-same-owner";
+            $extractCmd = "tar -xf \"{$winArchiveFile}\" -C \"{$winTargetPath}\" --strip-components=1";
         } elseif (str_ends_with($archiveFile, '.tar.gz') || str_ends_with($archiveFile, '.tgz')) {
-            $extractCmd = "tar -xzf \"{$archiveFile}\" --strip-components=1 -C . --one-top-level={$depName} --no-same-owner";
+            $extractCmd = "tar -xzf \"{$winArchiveFile}\" -C \"{$winTargetPath}\" --strip-components=1";
         }
 
         if (empty($extractCmd)) {
@@ -1196,41 +1255,103 @@ class InstallPhpExtensions extends Command
             return;
         }
 
-        // Execute extraction
-        $extractResult = Process::path($sourcePath)->run($extractCmd);
+        // Execute extraction with proper Windows environment variables
+        $extractResult = Process::env([
+            'MSYS2_ARG_CONV_EXCL' => '*',  // Disable path conversion for all arguments
+            'MSYS_NO_PATHCONV' => '1',     // Additional protection for Git Bash
+            'PATH' => getenv('PATH')
+        ])->run($extractCmd);
 
         if ($extractResult->successful()) {
             $this->info("  ✅ {$depName} extracted successfully");
-
-            // Verify extraction by checking for essential files
             $this->verifyTarExtraction($targetPath, $depName);
         } else {
             $this->warn("  ⚠️ Failed to extract {$depName}: " . $extractResult->errorOutput());
 
-            // Try alternative extraction method without problematic options
-            $this->info("  - Trying alternative extraction method...");
-            $alternativeCmd = '';
+            // Try with improved tar command for Windows
+            $this->info("  - Trying Windows-optimized tar extraction...");
+            $windowsOptimizedResult = $this->tryWindowsOptimizedExtraction($archiveFile, $targetPath, $depName);
+            if (!$windowsOptimizedResult) {
+                // Try with 7-zip if available (Windows fallback)
+                $this->info("  - Trying 7-zip extraction method...");
+                $sevenZipResult = $this->trySevenZipExtraction($archiveFile, $targetPath, $depName);
 
-            if (str_ends_with($archiveFile, '.tar.xz')) {
-                $alternativeCmd = "tar -xf \"{$archiveFile}\" -C \"{$targetPath}\" --strip-components=1";
-            } elseif (str_ends_with($archiveFile, '.tar.gz') || str_ends_with($archiveFile, '.tgz')) {
-                $alternativeCmd = "tar -xzf \"{$archiveFile}\" -C \"{$targetPath}\" --strip-components=1";
-            }
+                if (!$sevenZipResult) {
+                    // Try PowerShell extraction for .tar.gz files
+                    $powerShellResult = $this->tryPowerShellExtraction($archiveFile, $targetPath, $depName);
 
-            if (!empty($alternativeCmd)) {
-                // Create target directory first
-                if (!file_exists($targetPath)) {
-                    mkdir($targetPath, 0755, true);
+                    if (!$powerShellResult) {
+                        // Final fallback: try without strip-components
+                        $this->info("  - Trying basic tar extraction...");
+                        $basicCmd = '';
+                        if (str_ends_with($archiveFile, '.tar.xz')) {
+                            $basicCmd = "tar -xf \"{$winArchiveFile}\" -C \"{$winTargetPath}\"";
+                        } elseif (str_ends_with($archiveFile, '.tar.gz') || str_ends_with($archiveFile, '.tgz')) {
+                            $basicCmd = "tar -xzf \"{$winArchiveFile}\" -C \"{$winTargetPath}\"";
+                        }
+
+                        if (!empty($basicCmd)) {
+                            $basicResult = Process::env([
+                                'MSYS2_ARG_CONV_EXCL' => '*',
+                                'MSYS_NO_PATHCONV' => '1',
+                                'PATH' => getenv('PATH')
+                            ])->run($basicCmd);
+
+                            if ($basicResult->successful()) {
+                                $this->info("  ✅ {$depName} extracted with basic method");
+                                $this->handleBasicExtractionCleanup($targetPath, $depName);
+                                $this->verifyTarExtraction($targetPath, $depName);
+                            } else {
+                                $this->error("  ❌ All extraction methods failed for {$depName}");
+                            }
+                        }
+                    }
                 }
-
-                $altResult = Process::run($alternativeCmd);
-                if ($altResult->successful()) {
-                    $this->info("  ✅ {$depName} extracted with alternative method");
-                    $this->verifyTarExtraction($targetPath, $depName);
-                } else {
-                    $this->error("  ❌ Both extraction methods failed for {$depName}");
-                }
             }
+        }
+    }
+
+    protected function tryWindowsOptimizedExtraction(string $archiveFile, string $targetPath, string $depName): bool
+    {
+        // Convert to Unix-style paths to avoid MSYS2 path conversion issues
+        $unixArchiveFile = str_replace('\\', '/', $archiveFile);
+        $unixTargetPath = str_replace('\\', '/', $targetPath);
+
+        // Convert Windows drive letters to Unix format (C:/ -> /c/)
+        if (preg_match('/^([A-Za-z]):\/(.*)/', $unixArchiveFile, $matches)) {
+            $unixArchiveFile = '/' . strtolower($matches[1]) . '/' . $matches[2];
+        }
+        if (preg_match('/^([A-Za-z]):\/(.*)/', $unixTargetPath, $matches)) {
+            $unixTargetPath = '/' . strtolower($matches[1]) . '/' . $matches[2];
+        }
+
+        $this->info("  - Using Unix-style paths: {$unixArchiveFile} -> {$unixTargetPath}");
+
+        // Use appropriate extraction command with Unix paths
+        $extractCmd = '';
+        if (str_ends_with($archiveFile, '.tar.xz')) {
+            $extractCmd = "tar -xf '{$unixArchiveFile}' -C '{$unixTargetPath}' --strip-components=1";
+        } elseif (str_ends_with($archiveFile, '.tar.gz') || str_ends_with($archiveFile, '.tgz')) {
+            $extractCmd = "tar -xzf '{$unixArchiveFile}' -C '{$unixTargetPath}' --strip-components=1";
+        }
+
+        if (empty($extractCmd)) {
+            return false;
+        }
+
+        $result = Process::env([
+            'MSYS2_ARG_CONV_EXCL' => '*',
+            'MSYS_NO_PATHCONV' => '1',
+            'PATH' => getenv('PATH')
+        ])->run($extractCmd);
+
+        if ($result->successful()) {
+            $this->info("  ✅ {$depName} extracted with Windows-optimized method");
+            $this->verifyTarExtraction($targetPath, $depName);
+            return true;
+        } else {
+            $this->warn("  ⚠️ Windows-optimized extraction failed: " . $result->errorOutput());
+            return false;
         }
     }
 
@@ -1245,50 +1366,15 @@ class InstallPhpExtensions extends Command
         $realContents = array_diff($contents, ['.', '..']);
 
         // Check for expected files based on dependency type
-        $expectedFiles = [];
-        switch ($depName) {
-            case 'nghttp2':
-                $expectedFiles = ['CMakeLists.txt', 'lib', 'configure'];
-                break;
-            case 'openssl':
-                $expectedFiles = ['Configure', 'config', 'crypto'];
-                break;
-            case 'zlib':
-                $expectedFiles = ['CMakeLists.txt', 'configure', 'zlib.h'];
-                break;
-            case 'libssh2':
-                $expectedFiles = ['CMakeLists.txt', 'src', 'include'];
-                break;
-            case 'bzip2':
-                $expectedFiles = ['Makefile', 'bzlib.h', 'bzip2.c'];
-                break;
-            case 'curl':
-                $expectedFiles = ['CMakeLists.txt', 'configure', 'lib', 'src'];
-                break;
-            case 'libpng':
-                $expectedFiles = ['CMakeLists.txt', 'configure', 'png.h'];
-                break;
-            case 'libjpeg':
-                $expectedFiles = ['CMakeLists.txt', 'configure', 'jpeglib.h'];
-                break;
-            case 'libzip':
-                $expectedFiles = ['CMakeLists.txt', 'configure', 'lib'];
-                break;
-            case 'xz':
-                $expectedFiles = ['CMakeLists.txt', 'configure', 'src'];
-                break;
-            case 'libwebp':
-                $expectedFiles = ['CMakeLists.txt', 'configure', 'src'];
-                break;
-            default:
-                // Generic check - should have more than just .spc-hash and build
-                if (count($realContents) > 2) {
-                    $this->info("  ✅ {$depName} appears to be properly extracted");
-                    return;
-                }
-        }
+        $expectedFiles = $this->getExpectedFilesForDependency($depName);
 
-        if (!empty($expectedFiles)) {
+        if (empty($expectedFiles)) {
+            // Generic check - should have more than just .spc-hash and build
+            if (count($realContents) > 2) {
+                $this->info("  ✅ {$depName} appears to be properly extracted");
+                return;
+            }
+        } else {
             $missingFiles = [];
             foreach ($expectedFiles as $expectedFile) {
                 if (!in_array($expectedFile, $realContents) && !file_exists($targetPath . '/' . $expectedFile)) {
@@ -1301,6 +1387,155 @@ class InstallPhpExtensions extends Command
             } else {
                 $this->warn("  ⚠️ {$depName} may be incomplete - missing: " . implode(', ', $missingFiles));
             }
+        }
+    }
+
+    protected function trySevenZipExtraction(string $archiveFile, string $targetPath, string $depName): bool
+    {
+        // Check if 7-zip is available
+        $sevenZipPaths = [
+            'C:\Program Files\7-Zip\7z.exe',
+            'C:\Program Files (x86)\7-Zip\7z.exe',
+            '7z' // If in PATH
+        ];
+
+        $sevenZipPath = null;
+        foreach ($sevenZipPaths as $path) {
+            if ($path === '7z' || file_exists($path)) {
+                $sevenZipPath = $path;
+                break;
+            }
+        }
+
+        if (!$sevenZipPath) {
+            $this->warn("  - 7-zip not found, skipping 7-zip extraction");
+            return false;
+        }
+
+        $this->info("  - Using 7-zip for extraction...");
+        $sevenZipResult = Process::run("\"{$sevenZipPath}\" x \"{$archiveFile}\" -o\"{$targetPath}\" -y");
+
+        if ($sevenZipResult->successful()) {
+            $this->info("  ✅ {$depName} extracted with 7-zip");
+            $this->handleBasicExtractionCleanup($targetPath, $depName);
+            $this->verifyTarExtraction($targetPath, $depName);
+            return true;
+        } else {
+            $this->warn("  ⚠️ 7-zip extraction failed: " . $sevenZipResult->errorOutput());
+            return false;
+        }
+    }
+    protected function tryPowerShellExtraction(string $archiveFile, string $targetPath, string $depName): bool
+    {
+        $this->info("  - Trying PowerShell extraction...");
+
+        // PowerShell command to extract archives
+        if (str_ends_with($archiveFile, '.tar.gz') || str_ends_with($archiveFile, '.tgz')) {
+            // For .tar.gz files, we need to extract the .gz first, then the .tar
+            $tempTarFile = $targetPath . '\\' . basename($archiveFile, '.gz');
+
+            $psCmd = "powershell -Command \"" .
+                "Add-Type -AssemblyName System.IO.Compression.FileSystem; " .
+                "\$gzStream = [System.IO.File]::OpenRead('{$archiveFile}'); " .
+                "\$tarStream = [System.IO.File]::Create('{$tempTarFile}'); " .
+                "\$gzipStream = New-Object System.IO.Compression.GzipStream(\$gzStream, [System.IO.Compression.CompressionMode]::Decompress); " .
+                "\$gzipStream.CopyTo(\$tarStream); " .
+                "\$gzipStream.Close(); \$tarStream.Close(); \$gzStream.Close(); " .
+                "Write-Host 'Decompressed to {$tempTarFile}'\"";
+
+            $result = Process::run($psCmd);
+
+            if ($result->successful() && file_exists($tempTarFile)) {
+                // Now extract the .tar file using tar
+                $tarResult = Process::run("tar -xf \"{$tempTarFile}\" -C \"{$targetPath}\" --strip-components=1");
+
+                // Clean up temp file
+                unlink($tempTarFile);
+
+                if ($tarResult->successful()) {
+                    $this->info("  ✅ {$depName} extracted with PowerShell + tar");
+                    return true;
+                }
+            }
+        } elseif (str_ends_with($archiveFile, '.tar.xz')) {
+            // For .tar.xz files, try using PowerShell with external tools or fall back to basic methods
+            $this->warn("  - PowerShell extraction for .tar.xz not implemented, falling back...");
+            return false;
+        }
+
+        return false;
+    }
+
+    protected function handleBasicExtractionCleanup(string $targetPath, string $depName): void
+    {
+        // When using basic extraction without --strip-components=1, we might get nested directories
+        // Try to flatten the structure if there's only one top-level directory
+        $contents = scandir($targetPath);
+        $realContents = array_diff($contents, ['.', '..']);
+
+        if (count($realContents) === 1) {
+            $singleDir = $targetPath . DIRECTORY_SEPARATOR . reset($realContents);
+            if (is_dir($singleDir)) {
+                $this->info("  - Flattening directory structure for {$depName}...");
+
+                // Move all contents from the nested directory to the target directory
+                $nestedContents = scandir($singleDir);
+                foreach ($nestedContents as $item) {
+                    if ($item === '.' || $item === '..')
+                        continue;
+
+                    $sourcePath = $singleDir . DIRECTORY_SEPARATOR . $item;
+                    $destPath = $targetPath . DIRECTORY_SEPARATOR . $item;
+
+                    // Use move command
+                    if (PHP_OS_FAMILY === 'Windows') {
+                        Process::run("move \"{$sourcePath}\" \"{$destPath}\"");
+                    } else {
+                        Process::run("mv \"{$sourcePath}\" \"{$destPath}\"");
+                    }
+                }
+
+                // Remove the empty nested directory
+                if (PHP_OS_FAMILY === 'Windows') {
+                    Process::run("rmdir \"{$singleDir}\"");
+                } else {
+                    Process::run("rmdir \"{$singleDir}\"");
+                }
+            }
+        }
+    }
+
+    protected function getExpectedFilesForDependency(string $depName): array
+    {
+        switch ($depName) {
+            case 'sqlite':
+                return ['sqlite3.c', 'sqlite3.h', 'Makefile'];
+            case 'nghttp2':
+                return ['CMakeLists.txt', 'lib', 'configure'];
+            case 'openssl':
+                return ['Configure', 'config', 'crypto'];
+            case 'zlib':
+                return ['CMakeLists.txt', 'configure', 'zlib.h'];
+            case 'libssh2':
+                return ['CMakeLists.txt', 'src', 'include'];
+            case 'bzip2':
+                return ['Makefile', 'bzlib.h', 'bzip2.c'];
+            case 'curl':
+                return ['CMakeLists.txt', 'configure', 'lib', 'src'];
+            case 'libpng':
+                return ['CMakeLists.txt', 'configure', 'png.h'];
+            case 'libjpeg':
+                return ['CMakeLists.txt', 'configure', 'jpeglib.h'];
+            case 'libzip':
+                return ['CMakeLists.txt', 'configure', 'lib'];
+            case 'xz':
+                return ['CMakeLists.txt', 'configure', 'src'];
+            case 'libwebp':
+                return ['CMakeLists.txt', 'configure', 'src'];
+            case 'libxml2':
+                return ['CMakeLists.txt', 'configure', 'include'];
+            default:
+                return [];
         }
     }
 }
