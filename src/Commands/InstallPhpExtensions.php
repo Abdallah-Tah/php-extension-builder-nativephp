@@ -354,6 +354,7 @@ class InstallPhpExtensions extends Command
     {
         $doctorResult = Process::path($spcPath)
             ->timeout(300)
+            ->env($this->getSpcEnvironment())
             ->run('php bin/spc doctor --auto-fix');
 
         if (!$doctorResult->successful()) {
@@ -367,7 +368,9 @@ class InstallPhpExtensions extends Command
         $this->info("Downloading PHP {$this->selectedPhpVersion} source...");
 
         // First try with specific version
-        $downloadResult = Process::path($spcPath)->run("php bin/spc download php-src --with-php={$this->selectedPhpVersion}");
+        $downloadResult = Process::path($spcPath)
+            ->env($this->getSpcEnvironment())
+            ->run("php bin/spc download php-src --with-php={$this->selectedPhpVersion}");
 
         if (!$downloadResult->successful()) {
             $this->warn("Specific PHP {$this->selectedPhpVersion} download failed. Checking available versions...");
@@ -391,7 +394,9 @@ class InstallPhpExtensions extends Command
 
         // Download micro SAPI (required for building)
         $this->info('Downloading micro SAPI...');
-        $microResult = Process::path($spcPath)->run('php bin/spc download micro');
+        $microResult = Process::path($spcPath)
+            ->env($this->getSpcEnvironment())
+            ->run('php bin/spc download micro');
 
         if (!$microResult->successful()) {
             throw new RuntimeException('Failed to download micro SAPI');
@@ -417,6 +422,7 @@ class InstallPhpExtensions extends Command
 
                 $downloadResult = Process::path($spcPath)
                     ->timeout(300)
+                    ->env($this->getSpcEnvironment())
                     ->run("php bin/spc download {$ext}");
 
                 if ($downloadResult->successful()) {
@@ -447,6 +453,7 @@ class InstallPhpExtensions extends Command
 
                 $downloadResult = Process::path($spcPath)
                     ->timeout(300)
+                    ->env($this->getSpcEnvironment())
                     ->run("php bin/spc download {$lib}");
 
                 if ($downloadResult->successful()) {
@@ -568,6 +575,42 @@ class InstallPhpExtensions extends Command
             }
         }
     }
+    /**
+     * Get the standard environment variables for SPC processes
+     */
+    protected function getSpcEnvironment(): array
+    {
+        return [
+            'PATH' => getenv('PATH') . ';C:\Program Files\Git\usr\bin',
+            'SPC_CONCURRENCY' => '1',
+            'CMAKE_BUILD_PARALLEL_LEVEL' => '1',
+            'VS_PATH' => 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.41.34120\bin\Hostx64\x64',
+            // Completely suppress Perl locale warnings by using Windows locale
+            'LC_ALL' => 'English_United States.1252',
+            'LC_CTYPE' => 'English_United States.1252',
+            'LC_NUMERIC' => 'English_United States.1252',
+            'LC_TIME' => 'English_United States.1252',
+            'LC_COLLATE' => 'English_United States.1252',
+            'LC_MONETARY' => 'English_United States.1252',
+            'LC_MESSAGES' => 'English_United States.1252',
+            'LANG' => 'English_United States.1252',
+            'LANGUAGE' => 'en',
+            // Perl-specific environment variables to suppress warnings
+            'PERL_BADLANG' => '0',
+            'PERL_UNICODE' => '',
+            'PERL_USE_UNSAFE_INC' => '0',
+            // Prevent MSYS2 path conversion issues
+            'MSYS2_ARG_CONV_EXCL' => '*',
+            'MSYS_NO_PATHCONV' => '1',
+            // Suppress other build warnings
+            'CMAKE_GENERATOR_PLATFORM' => 'x64',
+            'CMAKE_BUILD_TYPE' => 'Release',
+            // Additional environment variables to reduce verbosity
+            'CMAKE_VERBOSE_MAKEFILE' => 'OFF',
+            'VERBOSE' => '0'
+        ];
+    }
+
     protected function buildPhpWithExtensions(string $spcPath): bool
     {
         // Build with selected extensions
@@ -581,12 +624,7 @@ class InstallPhpExtensions extends Command
 
         $buildProcess = Process::path($spcPath)
             ->timeout(7200) // 2 hour timeout for full build
-            ->env([
-                'PATH' => getenv('PATH') . ';C:\Program Files\Git\usr\bin',
-                'SPC_CONCURRENCY' => '1',
-                'CMAKE_BUILD_PARALLEL_LEVEL' => '1',
-                'VS_PATH' => 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.41.34120\bin\Hostx64\x64'
-            ])
+            ->env($this->getSpcEnvironment())
             ->run($buildCmd);
 
         if (!$buildProcess->successful()) {
