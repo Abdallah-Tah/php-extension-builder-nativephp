@@ -1,5 +1,5 @@
 {
-    "name": "amohamed/nativephp-custom-php",
+    "name": "amohamed/php-extension-builder-nativephp",
     "description": "Laravel package to install PHP extensions with NativePHP compatibility",
     "type": "library",
     "license": "MIT",
