@@ -1,5 +1,5 @@
 {
-    "name": "amohamed/php-extension-builder-nativephp",
+    "name": "amohamed/pc",
     "description": "Laravel package to install PHP extensions with NativePHP compatibility",
     "type": "library",
     "license": "MIT",
@@ -21,8 +21,8 @@
         }
     ],
     "support": {
-        "issues": "https://github.com/Abdallah-Tah/nativephp-php-custom/issues",
-        "source": "https://github.com/Abdallah-Tah/nativephp-php-custom"
+        "issues": "https://github.com/Abdallah-Tah/php-extension-builder-nativephp/issues",
+        "source": "https://github.com/Abdallah-Tah/php-extension-builder-nativephp"
     },
     "autoload": {
         "psr-4": {
@@ -72,7 +72,7 @@
     "repositories": [
         {
             "type": "vcs",
-            "url": "https://github.com/Abdallah-Tah/nativephp-bin-php"
+            "url": "https://github.com/Abdallah-Tah/php-extension-builder-nativephp"
         }
     ]
 }
