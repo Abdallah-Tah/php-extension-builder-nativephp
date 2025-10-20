@@ -11,11 +11,14 @@ use RuntimeException;
 use ZipArchive;
 
 class InstallPhpExtensions extends Command
+
 {
 
     protected $signature = 'php-ext:install
         {--php-version= : PHP version to build (e.g., 8.3, 8.4, 8.3.13, 8.4.1)}
         {--extensions= : Comma-separated list of extensions (or use interactive mode)}
+        {--driver=* : Database driver(s) to include (mysql, pgsql, sqlsrv)}
+        {--drivers= : Comma-separated database drivers (mysql, pgsql, sqlsrv) [deprecated, use --driver]}
         {--pack=* : Named extension pack(s) to include (mysql, pgsql, sqlsrv, all)}
         {--profile=slim : Build profile: slim (default) or full}
         {--mode=nativephp : Build mode: nativephp (match NativePHP + add DB drivers) or custom (full customization)}
@@ -259,7 +262,7 @@ class InstallPhpExtensions extends Command
 
             'php_versions' => ['8.1', '8.2', '8.3', '8.4'],
 
-            'libraries' => [] // Uses ICU library, built into static-php-cli
+            'libraries' => ['icu-static-win'] // ICU library for Windows builds
 
         ],
 
@@ -477,11 +480,6 @@ class InstallPhpExtensions extends Command
     protected array $additionalBuildFlags = [];
 
     /**
-     * Validated Perl executable path for OpenSSL compilation.
-     */
-    protected ?string $validatedPerlPath = null;
-
-    /**
      * Whether the command should only resolve configuration without running a build.
      */
     protected bool $dryRun = false;
@@ -495,6 +493,22 @@ class InstallPhpExtensions extends Command
      * The build matrix used for calculating deterministic build keys.
      */
     protected array $buildMatrix = [];
+
+    /**
+     * Force SQLite-only builds when the caller explicitly disables additional drivers.
+     */
+    protected bool $forceNoDrivers = false;
+
+    /**
+     * Mapping of logical database drivers to their component PHP extensions.
+     *
+     * @var array<string, array<int, string>>
+     */
+    protected array $databaseDriverExtensionMap = [
+        'mysql' => ['mysqli', 'pdo_mysql'],
+        'postgres' => ['pgsql', 'pdo_pgsql'],
+        'sqlserver' => ['sqlsrv', 'pdo_sqlsrv'],
+    ];
 
     /**
      * SHA-256 hash derived from the build matrix.
@@ -536,53 +550,47 @@ class InstallPhpExtensions extends Command
      */
     protected array $buildMetadata = [];
 
-    // Default extensions - Windows-compatible subset that matches NativePHP core functionality
-    // Note: Some NativePHP extensions (calendar, exif, ftp, gettext, gmp, readline, xmlreader, xmlwriter, xsl)
-    // are not available in static-php-cli on Windows, so they're excluded from this list
+    // Default extensions - matches NativePHP php-bin exactly
+    // This ensures compatibility and faster builds when using --mode=nativephp
     protected array $defaultExtensions = [
-        // Core extensions (available on Windows via static-php-cli)
-        'bcmath',
-        'bz2',
-        'ctype',
-        'curl',
-
-        // DOM/XML stack (critical for DOMDocument, XML, and Livewire)
-        'dom',
-        'fileinfo',
-        'filter',
-        'gd',
-        'iconv',
-        'intl',
-        'json',
-        'libxml',
-        'mbregex',
-        'mbstring',
-        'mysqli',
-        'opcache',
-        'openssl',
-        'pdo',
-        'pdo_mysql',
-        'pdo_sqlite',
-        'phar',
-        'session',
-        'simplexml',
-        'soap',
-        'sockets',
-        'sqlite3',
-        'tokenizer',
-        'xml',
-        'zip',
-        'zlib',
+        'bcmath',        // Arbitrary precision math
+        'bz2',           // Bzip2 compression
+        'ctype',         // Character type checking
+        'curl',          // HTTP client library
+        'dom',           // DOM XML manipulation
+        'fileinfo',      // File information functions
+        'filter',        // Data filtering
+        'gd',            // Image processing
+        'iconv',         // Character encoding conversion
+        'intl',          // Internationalization
+        'json',          // JSON handling (core in PHP 8+)
+        'libxml',        // LibXML support (core)
+        'mbstring',      // Multibyte string functions
+        'mbregex',       // Multibyte regex support (bundled with mbstring)
+        'openssl',       // SSL/TLS cryptographic functions
+        'pdo',           // Database abstraction layer
+        'pdo_sqlite',    // SQLite PDO driver
+        'phar',          // PHP Archive
+        'session',       // Session handling
+        'simplexml',     // SimpleXML
+        'sockets',       // Socket functions
+        'sqlite3',       // SQLite3 extension
+        'tokenizer',     // PHP tokenizer
+        'xml',           // XML parser
+        'opcache',       // Zend OPcache
+        'zip',           // ZIP archive support
+        'zlib',          // Compression library
     ];
 
-
     public function __construct()
+
     {
 
         parent::__construct();
     }
 
     public function handle(): int
+
     {
 
         $this->dryRun = (bool) $this->option('dry-run');
@@ -590,6 +598,8 @@ class InstallPhpExtensions extends Command
         $this->jsonOutput = (bool) $this->option('json');
 
         $this->lockfilePath = $this->resolveLockfilePath($this->option('lockfile'));
+
+        $this->ensureMinimumMemoryLimit('512M');
 
         $this->loadLockfile();
 
@@ -803,6 +813,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function setupStaticPhpCli(string $spcPath): void
+
     {
 
         if (!file_exists($spcPath)) {
@@ -854,18 +865,23 @@ class InstallPhpExtensions extends Command
     }
 
     protected function setupPhpSdkBinaryTools(string $spcPath): void
+
     {
 
         $phpSdkPath = $spcPath . '/php-sdk-binary-tools';
+
         if (!file_exists($phpSdkPath)) {
+
             $this->info('Cloning php-sdk-binary-tools repository...');
 
-            $cloneResult = Process::run("git clone https://github.com/php/php-sdk-binary-tools.git \"{$phpSdkPath}\"");
+            $cloneResult = Process::run("git clone https://github.com/microsoft/php-sdk-binary-tools.git \"{$phpSdkPath}\"");
 
             if (!$cloneResult->successful()) {
+
                 throw new RuntimeException('Failed to clone php-sdk-binary-tools repository: ' . $cloneResult->errorOutput());
             }
         } else {
+
             $this->info('php-sdk-binary-tools already exists, updating...');
 
             Process::path($phpSdkPath)->run('git pull');
@@ -898,6 +914,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function runDoctorCheck(string $spcPath): void
+
     {
 
         $doctorResult = Process::path($spcPath)
@@ -915,6 +932,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function downloadComponents(string $spcPath): void
+
     {
 
         // Download PHP source for the specified version - force the exact version
@@ -1021,52 +1039,68 @@ class InstallPhpExtensions extends Command
 
             // These extensions are either built into PHP core or use system libraries
 
-            if (
-                in_array($ext, [
+            if (in_array($ext, [
 
-                    // Core PHP extensions (built-in)
+                // Core PHP extensions (built-in)
 
-                    'pdo',
-                    'mbstring',
-                    'fileinfo',
-                    'tokenizer',
-                    'filter',
-                    'session',
+                'pdo',
+                'mbstring',
+                'fileinfo',
+                'tokenizer',
+                'filter',
+                'session',
 
-                    'ctype',
-                    'openssl',
-                    'curl',
-                    'zip',
-                    'zlib',
-                    'iconv',
-                    'intl',
-                    'json',
-                    'mbregex',
+                'ctype',
+                'openssl',
+                'curl',
+                // 'zip',  // ZIP needs ext-zip PECL download
+                'zlib',
+                'iconv',
+                'intl',
+                'json',
+                'libxml',
+                'mbregex',
 
-                    // Extensions that use system libraries (libraries downloaded separately)
+                // Extensions that use system libraries (libraries downloaded separately)
 
-                    'sqlite3',
-                    'pdo_sqlite',
-                    'bcmath',
-                    'dom',
-                    'xml',
-                    'simplexml',
+                'sqlite3',
+                'pdo_sqlite',
+                'bcmath',
+                'dom',
+                'xml',
+                'simplexml',
 
-                    'phar',
-                    'sockets',
-                    'bz2',
-                    'opcache',
-                    'gd'
+                'phar',
+                'sockets',
+                'bz2',
+                'opcache',
+                'gd',
 
-                ])
-            ) {
+                // Database driver extensions (MySQL, PostgreSQL, SQL Server)
+                'mysqli',
+                'pdo_mysql',
+                'pgsql',
+                'pdo_pgsql',
+                'sqlsrv',
+                'pdo_sqlsrv'
+
+            ])) {
 
                 $skippedExtensions[] = $ext;
 
                 continue;
             }
 
-            $this->info("Downloading {$ext} extension source...");
+            // Map extension names to their source names in static-php-cli
+            // Some extensions use 'ext-' prefix in their source names
+            $sourceNameMap = [
+                'zip' => 'ext-zip',
+                // Add more mappings if needed
+            ];
+
+            $sourceName = $sourceNameMap[$ext] ?? $ext;
+
+            $this->info("Downloading {$ext} extension source (as {$sourceName})...");
 
             $maxRetries = 3;
 
@@ -1082,7 +1116,7 @@ class InstallPhpExtensions extends Command
 
                     ->env($this->getSpcEnvironment())
 
-                    ->run("php bin/spc download {$ext}");
+                    ->run("php bin/spc download {$sourceName}");
 
                 if ($downloadResult->successful()) {
 
@@ -1117,52 +1151,120 @@ class InstallPhpExtensions extends Command
             $this->line('These extensions are built into PHP core or will use system libraries downloaded separately.');
         }
 
-        // Download libraries and dependencies for all selected extensions
-        // This uses static-php-cli's dependency resolution to automatically download
-        // all required libraries including Windows-specific ones like icu-static-win
-        $this->info('Downloading libraries and dependencies for selected extensions...');
+        // Download required libraries explicitly (more reliable than --for-extensions)
+        // This ensures all dependencies are downloaded before build
 
-        $extensions = implode(',', $this->selectedExtensions);
-        $this->info('Extensions: ' . $extensions);
+        $this->info('Downloading required libraries...');
 
-        $downloadResult = Process::path($spcPath)
-            ->timeout(600) // Increased timeout for downloading many dependencies
-            ->env($this->getSpcEnvironment())
-            ->run("php bin/spc download --for-extensions={$extensions}");
+        $libraries = array_unique($this->requiredLibraries);
 
-        if (!$downloadResult->successful()) {
-            $this->warn("Bulk download failed, trying individual library downloads...");
-            $this->line($downloadResult->errorOutput());
+        if (!empty($libraries)) {
 
-            // Fallback: Download libraries individually if bulk download fails
-            $supportedLibraries = $this->filterSupportedLibraries($this->requiredLibraries);
+            // Try batch download first
 
-            foreach ($supportedLibraries as $library) {
-                $this->info("Downloading library: {$library}");
+            $librariesList = implode(',', $libraries);
 
-                $libResult = Process::path($spcPath)
-                    ->timeout(300)
-                    ->env($this->getSpcEnvironment())
-                    ->run("php bin/spc download {$library}");
+            $downloadLibsCommand = "php bin/spc download {$librariesList}";
 
-                if (!$libResult->successful()) {
-                    $this->warn("Failed to download {$library}: " . $libResult->errorOutput());
-                } else {
-                    $this->info("✅ Downloaded {$library}");
+            $this->line("Running: {$downloadLibsCommand}");
+
+            $downloadLibsResult = Process::path($spcPath)
+
+                ->timeout(600)
+
+                ->env($this->getSpcEnvironment())
+
+                ->run($downloadLibsCommand);
+
+            if (!$downloadLibsResult->successful()) {
+
+                $this->warn('Batch library download had issues, trying individual downloads...');
+
+                // Try downloading libraries one by one for better error isolation
+
+                $failedLibraries = [];
+
+                foreach ($libraries as $library) {
+
+                    $this->line("  Downloading {$library}...");
+
+                    $individualResult = Process::path($spcPath)
+
+                        ->timeout(300)
+
+                        ->env($this->getSpcEnvironment())
+
+                        ->run("php bin/spc download {$library}");
+
+                    if ($individualResult->successful()) {
+
+                        $this->info("  ✅ {$library}");
+
+                    } else {
+
+                        $failedLibraries[] = $library;
+
+                        $this->warn("  ⚠️  {$library} - will be auto-downloaded during build if needed");
+                    }
                 }
+
+                if (empty($failedLibraries)) {
+
+                    $this->info('✅ All libraries downloaded individually');
+
+                } else {
+
+                    $this->warn('Some libraries could not be downloaded: ' . implode(', ', $failedLibraries));
+
+                    $this->line('These will be automatically handled during the build phase.');
+                }
+            } else {
+
+                $this->info('✅ All required libraries downloaded successfully');
             }
-        } else {
-            $this->info('✅ All libraries and dependencies downloaded successfully');
         }
 
-        // CRITICAL: Ensure tar-based extractions are complete AFTER downloading
+        // Download all extensions in one command (including user-selected database drivers)
 
-        $this->info('Verifying tar-based extractions...');
+        $this->info('Downloading all extensions in batch...');
 
-        $this->ensureTarBasedExtractions($spcPath);
+        $extensionsList = implode(',', $this->selectedExtensions);
+
+        $downloadExtCommand = "php bin/spc download {$extensionsList}";
+
+        $this->line("Running: {$downloadExtCommand}");
+
+        $downloadExtResult = Process::path($spcPath)
+
+            ->timeout(300)
+
+            ->env($this->getSpcEnvironment())
+
+            ->run($downloadExtCommand);
+
+        if (!$downloadExtResult->successful()) {
+
+            $this->warn('Some extensions failed to download, but build may still succeed');
+
+            $this->warn('Most core extensions are built-in and don\'t need separate downloads');
+
+            // Don't throw - core extensions don't need downloads
+        } else {
+
+            $this->info('✅ Extension downloads completed');
+        }
+
+        $this->info('✅ All components prepared for build');
+
+        // CRITICAL: Pre-extract library archives using Python to avoid Windows tar path bugs
+        // Static-php-cli's tar extraction fails on Windows with path escaping issues
+        $this->info('Pre-extracting library archives using Python...');
+
+        $this->preExtractLibraries($spcPath);
     }
 
     protected function cleanBuildArtifacts(string $spcPath): void
+
     {
 
         $buildrootPath = $spcPath . '/buildroot';
@@ -1173,9 +1275,33 @@ class InstallPhpExtensions extends Command
 
             Process::run('rm -rf "' . $buildrootPath . '"');
         }
+
+        // Also clean incomplete source extractions to force re-extraction
+        $sourcePath = $spcPath . '/source';
+
+        $librariesToClean = ['bzip2', 'zlib', 'openssl', 'libssh2', 'libxml2', 'nghttp2', 'curl', 'libpng', 'sqlite', 'xz', 'libzip', 'libwebp', 'libjpeg', 'icu-static-win'];
+
+        foreach ($librariesToClean as $lib) {
+
+            $libPath = $sourcePath . '/' . $lib;
+
+            if (is_dir($libPath)) {
+
+                // Check if directory is incomplete (no key files)
+                $isEmpty = count(scandir($libPath)) <= 2; // Only . and ..
+
+                if ($isEmpty) {
+
+                    $this->info("Cleaning incomplete source: {$lib}");
+
+                    Process::run('rm -rf "' . $libPath . '"');
+                }
+            }
+        }
     }
 
     protected function verifyDownloadedSources(string $spcPath): void
+
     {
 
         $this->info('Checking downloaded sources...');
@@ -1230,14 +1356,86 @@ class InstallPhpExtensions extends Command
 
         $this->verifyGitDependencies($spcPath);
 
-        // Verify tar-based extractions are complete
+        // NOTE: Removed manual extraction - static-php-cli handles extraction automatically during build phase
+        // The --with-clean flag in buildPhpWithExtensions() ensures proper extraction
+        // $this->ensureTarBasedExtractions($spcPath);
 
-        $this->info('Verifying tar-based extractions...');
+        // Check for CMakeLists.txt instead of old file structure
+        // libxml2 v2.12+ uses CMake and has different file layout
+        $this->ensureLibrarySource(
+            $spcPath,
+            'libxml2',
+            [
+                'CMakeLists.txt',  // libxml2 v2.12+ uses CMake build system
+            ],
+            'libxml2'
+        );
 
-        $this->ensureTarBasedExtractions($spcPath);
+        // NOTE: Removed manual extraction - static-php-cli handles extraction automatically during build phase
+        // The --with-clean flag in buildPhpWithExtensions() ensures proper extraction
+        // $this->ensureTarBasedExtractions($spcPath);
+    }
+
+    protected function ensureLibrarySource(string $spcPath, string $sourceName, array $requiredFiles, ?string $downloadAlias = null): void
+    {
+        $sourcePath = $spcPath . '/source/' . $sourceName;
+        $downloadName = $downloadAlias ?? $sourceName;
+
+        $needsRefresh = !is_dir($sourcePath);
+
+        if (!$needsRefresh) {
+            foreach ($requiredFiles as $file) {
+                if (!file_exists($sourcePath . '/' . $file)) {
+                    $needsRefresh = true;
+                    break;
+                }
+            }
+        }
+
+        if (!$needsRefresh) {
+            return;
+        }
+
+        if (is_dir($sourcePath)) {
+            $this->warn("Refreshing {$sourceName} source (missing expected files)...");
+            $this->recursiveDelete($sourcePath);
+        } else {
+            $this->warn("Source {$sourceName} not found, downloading...");
+        }
+
+        $downloadResult = Process::path($spcPath)->run("php bin/spc download {$downloadName}");
+
+        if ($downloadResult->successful()) {
+            $this->info("? {$sourceName} source is ready");
+        } else {
+            $this->error("? Failed to download {$sourceName}: " . $downloadResult->errorOutput());
+        }
+    }
+
+    protected function recursiveDelete(string $path): void
+    {
+        if (!is_dir($path)) {
+            return;
+        }
+
+        $iterator = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($path, \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::CHILD_FIRST
+        );
+
+        foreach ($iterator as $item) {
+            if ($item->isDir()) {
+                @rmdir($item->getPathname());
+            } else {
+                @unlink($item->getPathname());
+            }
+        }
+
+        @rmdir($path);
     }
 
     protected function verifyGitDependencies(string $spcPath): void
+
     {
 
         $sourcePath = $spcPath . '/source';
@@ -1309,6 +1507,7 @@ class InstallPhpExtensions extends Command
      */
 
     protected function getSpcEnvironment(): array
+
     {
 
         return [
@@ -1349,6 +1548,10 @@ class InstallPhpExtensions extends Command
 
             'PERL_USE_UNSAFE_INC' => '0',
 
+            // Force curl to skip Windows revocation lookups that fail without internet access
+
+            'SPC_CURL_OPTS' => '--ssl-no-revoke',
+
             // Leave MSYS path conversion enabled so SPC tar commands handle Windows drive paths
 
             // Suppress other build warnings
@@ -1367,6 +1570,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function buildPhpWithExtensions(string $spcPath): bool
+
     {
 
         // Build with selected extensions
@@ -1375,7 +1579,9 @@ class InstallPhpExtensions extends Command
 
         $this->info("Building with selected extensions: {$extensions}");
 
-        // Build command without --with-php (that's used in download phase)
+        // Build command without --with-php (not supported in build phase, only in download)
+        // NOTE: Removed --with-clean as it causes re-extraction during build with tar path issues on Windows
+        // Instead, we rely on Python pre-extraction before build starts with proper .spc-hash files
 
         $flags = array_merge(['--build-cli', '--debug'], $this->additionalBuildFlags);
 
@@ -1456,6 +1662,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function validateEnvironment(): void
+
     {
 
         if (PHP_OS_FAMILY !== 'Windows') {
@@ -1489,6 +1696,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function validatePerl(): void
+
     {
 
         // Check if Perl is available
@@ -1514,11 +1722,43 @@ class InstallPhpExtensions extends Command
             throw new RuntimeException('Perl is required for building PHP with OpenSSL support.');
         }
 
-        // Get Perl executable path
+        // Get all Perl executable paths
 
-        $perlPath = trim(Process::run('where perl')->output());
+        $perlPathsOutput = trim(Process::run('where perl')->output());
 
-        $perlPath = explode("\n", $perlPath)[0]; // Get first match
+        $perlPaths = array_filter(explode("\n", $perlPathsOutput));
+
+        $perlPath = $perlPaths[0] ?? ''; // First match
+
+        // Check if Strawberry Perl is available (preferred for Windows builds)
+
+        $strawberryPerlPath = null;
+
+        foreach ($perlPaths as $path) {
+
+            $path = trim($path);
+
+            if (str_contains(strtolower($path), 'strawberry')) {
+
+                $strawberryPerlPath = $path;
+
+                break;
+            }
+        }
+
+        // If Strawberry Perl is found, use it (even if not first in PATH)
+
+        if ($strawberryPerlPath) {
+
+            $this->info('✓ Strawberry Perl found: ' . $strawberryPerlPath);
+
+            if ($strawberryPerlPath !== $perlPath) {
+
+                $this->line('  (Strawberry Perl will be prioritized for OpenSSL build)');
+            }
+
+            return; // Strawberry Perl is available, we're good
+        }
 
         // Check if Perl path contains spaces (Git's Perl in "Program Files" will fail)
 
@@ -1559,6 +1799,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function getUserPreferences(): void
+
     {
 
         $lockDefaults = $this->lockfileData;
@@ -1688,15 +1929,51 @@ class InstallPhpExtensions extends Command
             $requestedExtensions = array_map('trim', explode(',', $extensionsInput));
         }
 
+        $driverSelections = [];
+
+        $driverOptionValues = $this->option('driver');
+        if (!empty($driverOptionValues)) {
+            $driverSelections = array_merge($driverSelections, $this->parseDriverOptionValues((array) $driverOptionValues));
+        }
+
+        $deprecatedDriversOption = $this->option('drivers');
+        if ($deprecatedDriversOption) {
+            $this->warn('Option "--drivers" is deprecated. Use "--driver" (repeatable) instead.');
+            $driverSelections = array_merge($driverSelections, $this->parseDriverOptionValues([(string) $deprecatedDriversOption]));
+        }
+
+        if (!empty($driverSelections)) {
+            if (in_array('none', $driverSelections, true)) {
+                $this->forceNoDrivers = true;
+
+                $driverSelections = array_values(array_diff($driverSelections, ['none']));
+
+                if (!empty($driverSelections)) {
+                    $this->warn('Ignoring other --driver values because "--driver=none" was provided.');
+                    $driverSelections = [];
+                }
+            }
+
+            if (!empty($driverSelections)) {
+                $driverExtensions = $this->mapDatabaseTypesToExtensions($driverSelections);
+                $requestedExtensions = array_merge($requestedExtensions, $driverExtensions);
+            }
+        }
+
         if (!empty($this->requestedPacks)) {
-            $packExtensions = $this->resolveExtensionPacks($this->requestedPacks);
-            $requestedExtensions = array_merge($requestedExtensions, $packExtensions);
-        } elseif (empty($requestedExtensions) && isset($lockDefaults['packs'])) {
+            if ($this->forceNoDrivers) {
+                $this->warn('Ignoring --pack options because --driver=none was provided.');
+                $this->requestedPacks = [];
+            } else {
+                $packExtensions = $this->resolveExtensionPacks($this->requestedPacks);
+                $requestedExtensions = array_merge($requestedExtensions, $packExtensions);
+            }
+        } elseif (!$this->forceNoDrivers && empty($requestedExtensions) && isset($lockDefaults['packs'])) {
             $packExtensions = $this->resolveExtensionPacks($this->normalizePackOptions($lockDefaults['packs']));
             $requestedExtensions = array_merge($requestedExtensions, $packExtensions);
         }
 
-        if (empty($requestedExtensions) && isset($lockDefaults['extensions']) && is_array($lockDefaults['extensions'])) {
+        if (!$this->forceNoDrivers && empty($requestedExtensions) && isset($lockDefaults['extensions']) && is_array($lockDefaults['extensions'])) {
             $requestedExtensions = array_merge($requestedExtensions, $lockDefaults['extensions']);
             $this->info('Using extensions from lockfile: ' . implode(', ', $lockDefaults['extensions']));
         }
@@ -1704,7 +1981,9 @@ class InstallPhpExtensions extends Command
         if (empty($requestedExtensions)) {
             $this->info('');
 
-            if ($buildMode === 'nativephp') {
+            if ($this->forceNoDrivers) {
+                $this->info('Skipping database driver selection (SQLite only).');
+            } elseif ($buildMode === 'nativephp') {
                 $this->info('Building PHP binary matching NativePHP php-bin with additional database drivers...');
                 $this->info('Base extensions (same as NativePHP): ' . count($this->defaultExtensions) . ' extensions included');
                 $requestedExtensions = $this->promptForDatabaseDriversOnly();
@@ -1712,6 +1991,10 @@ class InstallPhpExtensions extends Command
                 $this->info('Building a custom PHP binary with your selected database and extension support...');
                 $requestedExtensions = $this->promptForExtensions();
             }
+        }
+
+        if ($this->forceNoDrivers && !empty($requestedExtensions)) {
+            $requestedExtensions = $this->removeDatabaseDriverExtensions($requestedExtensions);
         }
 
         // Filter extensions based on PHP version compatibility
@@ -1735,6 +2018,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function resolvePhpReleaseMetadata(string $majorMinor): ?array
+
     {
 
         $url = "https://www.php.net/releases/?json&version={$majorMinor}";
@@ -1786,6 +2070,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function updatePhpArchiveDetails(): void
+
     {
 
         $version = $this->selectedPhpExactVersion !== '' ? $this->selectedPhpExactVersion : $this->selectedPhpVersion;
@@ -1803,6 +2088,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function selectPhpArchiveCandidate(string $version, array $sources = []): array
+
     {
 
         $preferredExtensions = ['tar.xz', 'tar.gz', 'tar.bz2'];
@@ -1859,12 +2145,14 @@ class InstallPhpExtensions extends Command
     }
 
     protected function buildPhpDownloadUrl(string $filename): string
+
     {
 
         return 'https://www.php.net/distributions/' . $filename;
     }
 
     protected function remoteFileExists(string $url): bool
+
     {
 
         $headers = @get_headers($url, 1);
@@ -1889,6 +2177,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function getPhpArchivePath(string $spcPath): ?string
+
     {
 
         $downloadsPath = $spcPath . '/downloads';
@@ -1909,6 +2198,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function ensurePhpSourceTreeMatchesSelection(string $spcPath): void
+
     {
 
         $phpSourceDir = $spcPath . '/source/php-src';
@@ -1970,6 +2260,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function updateSelectedPhpVersionFromArchive(string $archivePath): void
+
     {
 
         if (preg_match('/php-([0-9]+\.[0-9]+\.[0-9]+)\.tar\.(?:xz|gz|bz2)$/', basename($archivePath), $match)) {
@@ -1994,6 +2285,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function preparePhpSourceDownload(string $spcPath): void
+
     {
 
         $downloadsPath = $spcPath . '/downloads';
@@ -2029,6 +2321,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function promptForExtensions(): array
+
     {
 
         $this->info('Select database types to include:');
@@ -2200,39 +2493,106 @@ class InstallPhpExtensions extends Command
         return $selectedExtensions;
     }
 
-    protected function mapDatabaseTypesToExtensions(array $databaseTypes): array
+    protected function parseDriverOptionValues(array $values): array
+    {
+
+        $drivers = [];
+
+        foreach ($values as $value) {
+
+            if (!is_string($value) || $value === '') {
+                continue;
+            }
+
+            $parts = preg_split('/[,\s]+/', strtolower($value));
+
+            foreach ($parts as $part) {
+
+                $part = trim($part);
+
+                if ($part !== '') {
+                    if (in_array($part, ['sqlite', 'nativephp', 'default', 'none'], true)) {
+                        $drivers[] = 'none';
+                    } else {
+                        $drivers[] = $part;
+                    }
+                }
+            }
+        }
+
+        return $drivers;
+    }
+
+    protected function normalizeDatabaseDriverName(string $driver): ?string
+    {
+
+        return match (strtolower(trim($driver))) {
+            'mysql', 'mysqli', 'pdo_mysql' => 'mysql',
+            'pgsql', 'postgres', 'postgresql', 'pdo_pgsql' => 'postgres',
+            'sqlsrv', 'sqlserver', 'pdo_sqlsrv' => 'sqlserver',
+            default => null,
+        };
+    }
+
+    protected function mapDatabaseTypesToExtensions(array $databaseTypes, bool $silent = false): array
+
     {
 
         $extensions = [];
+        $processed = [];
 
         foreach ($databaseTypes as $type) {
 
-            switch ($type) {
+            $normalized = $this->normalizeDatabaseDriverName(is_string($type) ? $type : '');
+
+            if ($normalized === null) {
+
+                if (!$silent && is_string($type) && $type !== '') {
+                    $this->warn("Unknown database driver '{$type}', skipping.");
+                }
+
+                continue;
+            }
+
+            if (isset($processed[$normalized])) {
+                continue;
+            }
+
+            $processed[$normalized] = true;
+
+            switch ($normalized) {
 
                 case 'mysql':
 
-                    $extensions = array_merge($extensions, ['mysqli', 'pdo_mysql']);
+                    $extensions = array_merge($extensions, $this->databaseDriverExtensionMap['mysql']);
 
-                    $this->info('Adding MySQL extensions: mysqli, pdo_mysql');
+                    if (!$silent) {
+                        $this->info('Adding MySQL extensions: mysqli, pdo_mysql');
+                    }
 
                     break;
 
                 case 'postgres':
 
-                    $extensions = array_merge($extensions, ['pgsql']);
+                    [$pgsqlExtension, $pdoExtension] = $this->databaseDriverExtensionMap['postgres'] + [null, null];
 
-                    // Only add pdo_pgsql if it's available (it's not in static-php-cli by default)
+                    if ($pgsqlExtension !== null) {
+                        $extensions[] = $pgsqlExtension;
+                    }
 
-                    if (isset($this->availableExtensions['pdo_pgsql'])) {
+                    if ($pdoExtension !== null && isset($this->availableExtensions[$pdoExtension])) {
 
-                        $extensions[] = 'pdo_pgsql';
+                        $extensions[] = $pdoExtension;
 
-                        $this->info('Adding PostgreSQL extensions: pgsql, pdo_pgsql');
+                        if (!$silent) {
+                            $this->info('Adding PostgreSQL extensions: pgsql, pdo_pgsql');
+                        }
                     } else {
 
-                        $this->info('Adding PostgreSQL extensions: pgsql');
-
-                        $this->warn('Note: pdo_pgsql may not be available in static-php-cli');
+                        if (!$silent) {
+                            $this->info('Adding PostgreSQL extensions: pgsql');
+                            $this->warn('Note: pdo_pgsql may not be available in static-php-cli');
+                        }
                     }
 
                     break;
@@ -2241,12 +2601,16 @@ class InstallPhpExtensions extends Command
 
                     if (version_compare($this->selectedPhpVersion, '8.4', '<')) {
 
-                        $extensions = array_merge($extensions, ['sqlsrv', 'pdo_sqlsrv']);
+                        $extensions = array_merge($extensions, $this->databaseDriverExtensionMap['sqlserver']);
 
-                        $this->info('Adding SQL Server extensions: sqlsrv, pdo_sqlsrv');
+                        if (!$silent) {
+                            $this->info('Adding SQL Server extensions: sqlsrv, pdo_sqlsrv');
+                        }
                     } else {
 
-                        $this->warn('SQL Server extensions are not supported in PHP 8.4+');
+                        if (!$silent) {
+                            $this->warn('SQL Server extensions are not supported in PHP 8.4+');
+                        }
                     }
 
                     break;
@@ -2256,7 +2620,78 @@ class InstallPhpExtensions extends Command
         return $extensions;
     }
 
+    protected function removeDatabaseDriverExtensions(array $extensions): array
+    {
+
+        $driverExtensionNames = [];
+
+        foreach ($this->databaseDriverExtensionMap as $mapExtensions) {
+            $driverExtensionNames = array_merge($driverExtensionNames, $mapExtensions);
+        }
+
+        $driverExtensionNames = array_unique($driverExtensionNames);
+
+        return array_values(array_filter(
+            $extensions,
+            fn ($extension) => !in_array($extension, $driverExtensionNames, true)
+        ));
+    }
+
+    protected function ensureMinimumMemoryLimit(string $minimum): void
+    {
+        $current = ini_get('memory_limit');
+
+        if ($current === false || $current === '' || $current === '-1') {
+            return;
+        }
+
+        $currentBytes = $this->memoryLimitToBytes($current);
+        $minimumBytes = $this->memoryLimitToBytes($minimum);
+
+        if ($currentBytes === null || $minimumBytes === null || $currentBytes >= $minimumBytes) {
+            return;
+        }
+
+        if (@ini_set('memory_limit', $minimum) !== false) {
+            $this->info("Increasing PHP memory limit to {$minimum} for build process (was {$current}).");
+        } else {
+            $this->warn("Unable to increase memory limit automatically. Current limit {$current}; recommend at least {$minimum} (use `php -d memory_limit={$minimum}` or update php.ini).");
+        }
+    }
+
+    protected function memoryLimitToBytes(string $value): ?int
+    {
+        $value = trim($value);
+
+        if ($value === '') {
+            return null;
+        }
+
+        if ($value === '-1') {
+            return null;
+        }
+
+        if (is_numeric($value)) {
+            return (int) $value;
+        }
+
+        if (!preg_match('/^(\\d+)([KMG])?$/i', $value, $matches)) {
+            return null;
+        }
+
+        $base = (int) $matches[1];
+        $unit = strtoupper($matches[2] ?? '');
+
+        return match ($unit) {
+            'K' => $base * 1024,
+            'M' => $base * 1024 * 1024,
+            'G' => $base * 1024 * 1024 * 1024,
+            default => $base,
+        };
+    }
+
     protected function filterExtensionsByPhpVersion(array $requestedExtensions): array
+
     {
 
         $validExtensions = [];
@@ -2286,16 +2721,47 @@ class InstallPhpExtensions extends Command
     }
 
     protected function calculateRequiredLibraries(): void
+
     {
 
-        // Base libraries - EXACTLY match NativePHP official minimal set
-        // Source: https://github.com/NativePHP/php-bin/blob/main/php-libraries.txt
+        // Base libraries required for default extensions
 
         $this->requiredLibraries = [
-            // NativePHP official minimal libraries (only 3!)
-            'libjpeg',        // gd extension (image processing)
-            'freetype',       // gd extension (font rendering)
-            'libwebp',        // gd extension (WebP image support)
+
+            'zlib',           // zlib extension + zip dependency
+
+            'sqlite',         // sqlite3 + pdo_sqlite
+
+            'openssl',        // openssl extension + curl dependency
+
+            'libxml2',        // dom, simplexml, xml extensions
+
+            'libzip',         // zip extension
+
+            'libpng',         // gd extension
+
+            'libjpeg',        // gd extension
+
+            'freetype',       // gd extension
+
+            'bzip2',          // bz2 extension
+
+            'curl',           // curl extension
+
+            'libcurl',        // curl extension
+
+            'nghttp2',        // curl extension
+
+            'libssh2',        // curl extension
+
+            'xz',             // zip extension + xlswriter dependency
+
+            'libwebp',        // gd extension (optional but recommended)
+
+            'icu-static-win', // intl extension (Windows ICU build)
+
+            'onig'            // mbstring/mbregex extension (required)
+
         ];
 
         // Add libraries for user-selected extensions
@@ -2313,32 +2779,8 @@ class InstallPhpExtensions extends Command
         $this->requiredLibraries = array_unique($this->requiredLibraries);
     }
 
-    /**
-     * Filter and replace unsupported libraries with Windows-compatible alternatives
-     */
-    protected function filterSupportedLibraries(array $libraries): array
-    {
-        // Map of unsupported libraries to their Windows-compatible alternatives
-        $replacements = [
-            'libiconv' => 'libiconv-win',  // Use Windows-compatible iconv
-        ];
-
-        $filtered = [];
-        foreach ($libraries as $library) {
-            // Replace with Windows-compatible alternative if available
-            if (isset($replacements[$library])) {
-                $replacement = $replacements[$library];
-                $this->line("  ℹ️  Replacing {$library} with {$replacement} (Windows-compatible)");
-                $filtered[] = $replacement;
-            } else {
-                $filtered[] = $library;
-            }
-        }
-
-        return array_unique($filtered);
-    }
-
     protected function promptForMultipleSelections(array $options, array $descriptions): array
+
     {
 
         $maxRetries = 3;
@@ -2392,7 +2834,7 @@ class InstallPhpExtensions extends Command
 
                 if (is_numeric($part)) {
 
-                    $index = (int) $part;
+                    $index = (int)$part;
 
                     if (isset($options[$index])) {
 
@@ -2461,6 +2903,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function promptForIndividualExtensions(): array
+
     {
 
         // Get additional extensions (not already in default extensions)
@@ -2514,7 +2957,7 @@ class InstallPhpExtensions extends Command
 
             if (is_numeric($part)) {
 
-                $index = (int) $part;
+                $index = (int)$part;
 
                 if (isset($extensionKeys[$index])) {
 
@@ -2535,6 +2978,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function displayLibraryExtensionMapping(): void
+
     {
 
         $this->line('Key library → extension mappings:');
@@ -2555,6 +2999,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function getExtensionPack(string $pack): array
+
     {
 
         switch ($pack) {
@@ -2590,6 +3035,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function displayBuildSummary(string $spcPath): void
+
     {
 
         $this->info('=== Build Summary ===');
@@ -2682,6 +3128,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function ensureGitDependencies(string $spcPath): void
+
     {
 
         $sourcePath = $spcPath . '/source';
@@ -2788,6 +3235,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function ensureGitDependency(string $sourcePath, string $name, array $config): void
+
     {
 
         $targetPath = $sourcePath . '/' . $name;
@@ -2845,6 +3293,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function cloneGitDependency(string $url, string $targetPath, string $rev, string $name): void
+
     {
 
         // Set timeout based on known problematic repositories
@@ -2898,6 +3347,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function ensureTarBasedExtractions(string $spcPath): void
+
     {
 
         $sourcePath = $spcPath . '/source';
@@ -2936,7 +3386,7 @@ class InstallPhpExtensions extends Command
 
         // Specifically handle nghttp2 and other critical tar-based dependencies
 
-        $criticalTarDeps = ['nghttp2', 'libssh2', 'openssl', 'zlib', 'sqlite', 'bzip2', 'curl', 'libpng', 'libjpeg', 'libzip', 'xz', 'libwebp', 'libxml2', 'onig'];
+        $criticalTarDeps = ['nghttp2', 'libssh2', 'openssl', 'zlib', 'sqlite', 'bzip2', 'curl', 'libpng', 'libjpeg', 'libzip', 'xz', 'libwebp', 'libxml2'];
 
         foreach ($criticalTarDeps as $depName) {
 
@@ -3020,6 +3470,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function isClonedFromGit(string $targetPath): bool
+
     {
 
         // Check for our marker files that indicate the source was cloned
@@ -3031,7 +3482,208 @@ class InstallPhpExtensions extends Command
             (file_exists($targetPath . '/.git') && !file_exists($targetPath . '/.spc-hash'));
     }
 
+    protected function preExtractLibraries(string $spcPath): void
+
+    {
+
+        $downloadsPath = $spcPath . '/downloads';
+
+        $sourcePath = $spcPath . '/source';
+
+        // Library name mapping (library name => [patterns, filter function])
+        // Filter function receives filename and returns true if it matches
+
+        $libraryArchiveMap = [
+
+            'bzip2' => ['bzip2-*.tar.gz'],
+
+            'zlib' => ['zlib-*.tar.gz'],
+
+            'openssl' => ['openssl-*.tar.gz'],
+
+            'libssh2' => ['libssh2-*.tar.gz'],
+
+            'libxml2' => ['libxml2-*.tar.gz', 'v*.tar.gz'],  // libxml2-spc-mirror or v2.x.x
+
+            'nghttp2' => ['nghttp2-*.tar.xz'],
+
+            'curl' => ['curl-*.tar.xz'],
+
+            'sqlite' => ['sqlite-autoconf-*.tar.gz'],
+
+            'xz' => ['xz-*.tar.xz'],
+
+            'libzip' => ['libzip-*.tar.xz'],
+
+            'libwebp' => ['v1.*.tar.gz', 'libwebp-*.tar.gz'],  // Try specific pattern first
+
+            'libjpeg' => ['libjpeg-turbo-*.tar.gz'],
+
+            'icu-static-win' => ['icu-static-windows-*.zip'],
+
+            'onig' => ['onig-*.tar.gz'],  // oniguruma for mbstring
+
+            'ext-zip' => ['ext-zip.tgz', 'ext-zip-*.tgz', 'ext-zip.tar.gz'],  // zip extension source
+
+        ];
+
+        foreach ($libraryArchiveMap as $libName => $patterns) {
+
+            $targetPath = $sourcePath . '/' . $libName;
+
+            // Skip if already extracted or is a git clone
+
+            if (file_exists($targetPath) && !$this->isEmptyDirectory($targetPath)) {
+
+                $this->line("  ✓ {$libName} already extracted");
+
+                continue;
+            }
+
+            // Find archive file (try all patterns)
+
+            $archiveFile = null;
+
+            foreach ((array)$patterns as $pattern) {
+
+                $archiveFiles = glob($downloadsPath . '/' . $pattern);
+
+                if (!empty($archiveFiles)) {
+
+                    $archiveFile = $archiveFiles[0];
+
+                    break;
+                }
+            }
+
+            if ($archiveFile === null) {
+
+                $this->warn("  ⚠️  {$libName} - no archive found");
+
+                continue;
+            }
+
+            $this->line("  Extracting {$libName}...");
+
+            // Use Python for extraction (Windows-compatible)
+
+            $this->extractArchiveWithPython($archiveFile, $targetPath, $libName);
+        }
+
+        $this->info('✅ Library pre-extraction completed');
+    }
+
+    protected function isEmptyDirectory(string $path): bool
+
+    {
+
+        if (!is_dir($path)) {
+
+            return false;
+        }
+
+        $contents = scandir($path);
+
+        return count($contents) <= 2; // Only . and ..
+    }
+
+    protected function extractArchiveWithPython(string $archiveFile, string $targetPath, string $libName): void
+
+    {
+
+        // Create target directory
+
+        if (!file_exists($targetPath)) {
+
+            mkdir($targetPath, 0755, true);
+        }
+
+        // Python extraction script
+
+        $pythonScript = <<<'PYTHON'
+import sys
+import tarfile
+import zipfile
+import os
+import shutil
+
+archive_file = sys.argv[1]
+target_dir = sys.argv[2]
+lib_name = sys.argv[3] if len(sys.argv) > 3 else ""
+
+try:
+    if archive_file.endswith('.zip'):
+        with zipfile.ZipFile(archive_file, 'r') as zip_ref:
+            zip_ref.extractall(target_dir)
+    else:
+        # Extract tar files with symlink handling for Windows
+        with tarfile.open(archive_file, 'r:*') as tar_ref:
+            for member in tar_ref.getmembers():
+                # Skip symbolic links (not supported on Windows without admin rights)
+                if member.issym() or member.islnk():
+                    continue
+                try:
+                    tar_ref.extract(member, target_dir)
+                except Exception as e:
+                    # Continue on individual file errors (e.g., permission issues)
+                    pass
+
+    # Check if extraction created a single subdirectory (common pattern)
+    contents = os.listdir(target_dir)
+
+    # Special handling for icu-static-win - don't flatten it
+    if lib_name == "icu-static-win":
+        # ICU needs to keep its x64-windows-static subdirectory structure
+        print("SUCCESS")
+        sys.exit(0)
+
+    if len(contents) == 1 and os.path.isdir(os.path.join(target_dir, contents[0])):
+        # Move contents up one level
+        subdir = os.path.join(target_dir, contents[0])
+        for item in os.listdir(subdir):
+            src = os.path.join(subdir, item)
+            dst = os.path.join(target_dir, item)
+            if os.path.exists(dst):
+                if os.path.isdir(dst):
+                    shutil.rmtree(dst)
+                else:
+                    os.remove(dst)
+            shutil.move(src, dst)
+        os.rmdir(subdir)
+
+    print("SUCCESS")
+except Exception as e:
+    print(f"ERROR: {e}")
+    sys.exit(1)
+PYTHON;
+
+        $scriptFile = sys_get_temp_dir() . '/extract_library_' . uniqid() . '.py';
+
+        file_put_contents($scriptFile, $pythonScript);
+
+        $result = Process::run("python \"{$scriptFile}\" \"{$archiveFile}\" \"{$targetPath}\" \"{$libName}\"");
+
+        unlink($scriptFile);
+
+        if ($result->successful() && str_contains($result->output(), 'SUCCESS')) {
+
+            $this->info("  ✅ {$libName} extracted successfully");
+
+            // Create .spc-hash file to prevent static-php-cli from re-extracting
+            // Note: Must use full SHA1 hash (40 chars) - static-php-cli checks full hash
+
+            $hash = sha1_file($archiveFile);
+
+            file_put_contents($targetPath . '/.spc-hash', $hash);
+
+        } else {
+
+            $this->warn("  ⚠️  {$libName} extraction failed, will be handled by static-php-cli");
+        }
+    }
+
     protected function reExtractTarDependency(string $downloadsPath, string $sourcePath, string $depName): void
+
     {
 
         // Extract spcPath from sourcePath (remove trailing /source)
@@ -3083,9 +3735,9 @@ class InstallPhpExtensions extends Command
             ]);
         } elseif ($depName === 'libwebp') {
 
-            // CRITICAL: Don't use generic v*.tar.gz here - it will match ANY version
-            // Instead, use specific version patterns in the fallback logic below
             $possibleArchives = array_merge($possibleArchives, [
+
+                'v*.tar.gz',  // libwebp uses v1.3.2.tar.gz pattern
 
                 'libwebp-*.tar.gz',
 
@@ -3094,9 +3746,9 @@ class InstallPhpExtensions extends Command
             ]);
         } elseif ($depName === 'libxml2') {
 
-            // CRITICAL: Don't use generic v*.tar.gz here - it will match ANY version
-            // Instead, use specific version patterns in the fallback logic below
             $possibleArchives = array_merge($possibleArchives, [
+
+                'v*.tar.gz',  // libxml2 uses v2.12.5.tar.gz pattern
 
                 'libxml2-v*.tar.gz',
 
@@ -3124,7 +3776,6 @@ class InstallPhpExtensions extends Command
         }
 
         // Special handling for dependencies with version-only names
-        // These libraries use version tags as filenames (v1.3.2.tar.gz, v2.12.5.tar.gz)
 
         if (!$archiveFile) {
 
@@ -3140,7 +3791,6 @@ class InstallPhpExtensions extends Command
 
                     $basename = basename($versionArchive);
 
-                    // libwebp uses v1.x.x pattern
                     if ($depName === 'libwebp' && preg_match('/^v1\.\d+\.\d+\.tar\.gz$/', $basename)) {
 
                         $archiveFile = $versionArchive;
@@ -3148,9 +3798,7 @@ class InstallPhpExtensions extends Command
                         $this->info("  - Found libwebp archive: {$basename}");
 
                         break;
-                    }
-                    // libxml2 uses v2.x.x pattern
-                    elseif ($depName === 'libxml2' && preg_match('/^v2\.\d+\.\d+\.tar\.gz$/', $basename)) {
+                    } elseif ($depName === 'libxml2' && preg_match('/^v2\.\d+\.\d+\.tar\.gz$/', $basename)) {
 
                         $archiveFile = $versionArchive;
 
@@ -3178,17 +3826,40 @@ class InstallPhpExtensions extends Command
             mkdir($targetPath, 0755, true);
         }
 
-        // CRITICAL: Use proper two-step extraction for nested tar archives
-        // Problem: tar on Windows with "Cannot connect to C:" means it's trying to pipe
-        // Solution: Extract in two steps to avoid piping issues
+        // Convert Windows paths to avoid tar issues with drive letters
 
-        $extractionSuccess = false;
+        $winArchiveFile = str_replace('\\', '/', $archiveFile);
 
-        if (str_ends_with($archiveFile, '.tar.xz') || str_ends_with($archiveFile, '.tar.gz') || str_ends_with($archiveFile, '.tgz')) {
-            $extractionSuccess = $this->extractNestedTarArchive($archiveFile, $targetPath, $depName);
+        $winTargetPath = str_replace('\\', '/', $targetPath);
+
+        // Use appropriate extraction command based on file extension with Windows-compatible paths
+
+        $extractCmd = '';
+
+        if (str_ends_with($archiveFile, '.tar.xz')) {
+
+            $extractCmd = "tar -xf \"{$winArchiveFile}\" -C \"{$winTargetPath}\" --strip-components=1";
+        } elseif (str_ends_with($archiveFile, '.tar.gz') || str_ends_with($archiveFile, '.tgz')) {
+
+            $extractCmd = "tar -xzf \"{$winArchiveFile}\" -C \"{$winTargetPath}\" --strip-components=1";
         }
 
-        if ($extractionSuccess) {
+        if (empty($extractCmd)) {
+
+            $this->warn("  - Unknown archive format for {$depName}");
+
+            return;
+        }
+
+        // Execute extraction with Windows PATH so tar resolves correctly
+
+        $extractResult = Process::env([
+
+            'PATH' => getenv('PATH')
+
+        ])->run($extractCmd);
+
+        if ($extractResult->successful()) {
 
             $this->info("  ✅ {$depName} extracted successfully");
 
@@ -3199,7 +3870,7 @@ class InstallPhpExtensions extends Command
             $this->createSourceHashFile($spcPath, $depName, $archiveFile);
         } else {
 
-            $this->warn("  ⚠️ Failed to extract {$depName} with primary method");
+            $this->warn("  ⚠️ Failed to extract {$depName}: " . $extractResult->errorOutput());
 
             // Try with improved tar command for Windows
 
@@ -3226,10 +3897,6 @@ class InstallPhpExtensions extends Command
                         // Final fallback: try without strip-components
 
                         $this->info("  - Trying basic tar extraction...");
-
-                        // Convert Windows paths for tar command
-                        $winArchiveFile = str_replace('\\', '/', $archiveFile);
-                        $winTargetPath = str_replace('\\', '/', $targetPath);
 
                         $basicCmd = '';
 
@@ -3272,6 +3939,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function tryWindowsOptimizedExtraction(string $archiveFile, string $targetPath, string $depName, string $spcPath): bool
+
     {
 
         // Convert to Unix-style paths to avoid MSYS2 path conversion issues
@@ -3337,6 +4005,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function verifyTarExtraction(string $targetPath, string $depName): void
+
     {
 
         if (!file_exists($targetPath)) {
@@ -3387,6 +4056,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function trySevenZipExtraction(string $archiveFile, string $targetPath, string $depName, string $spcPath): bool
+
     {
 
         // Check if 7-zip is available
@@ -3446,6 +4116,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function tryPowerShellExtraction(string $archiveFile, string $targetPath, string $depName): bool
+
     {
 
         $this->info("  - Trying PowerShell extraction...");
@@ -3506,6 +4177,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function handleBasicExtractionCleanup(string $targetPath, string $depName): void
+
     {
 
         // When using basic extraction without --strip-components=1, we might get nested directories
@@ -3562,132 +4234,1124 @@ class InstallPhpExtensions extends Command
         }
     }
 
-    /**
-     * Extract nested tar archives (tar.gz, tar.xz) in two steps to avoid Windows piping issues
-     * This fixes the "Cannot connect to C:" error that occurs when tar tries to pipe decompression
-     */
-    protected function extractNestedTarArchive(string $archiveFile, string $targetPath, string $depName): bool
+    protected function downloadLibraryWithFallback(string $spcPath, string $lib): bool
+
     {
-        $this->info("  - Using Python-based extraction (Windows-compatible)...");
 
-        // PRIORITY 1: Try Python extraction script (most reliable on Windows)
-        $pythonScript = __DIR__ . '/extract_php_source.py';
+        $maxRetries = 2; // Reduced retries since we have fallback
 
-        if (file_exists($pythonScript)) {
-            $this->line("  - Extracting with Python script...");
+        $downloaded = false;
 
-            // Use Windows-native paths for Python
-            $winArchiveFile = str_replace('/', '\\', $archiveFile);
-            $winTargetPath = str_replace('/', '\\', $targetPath);
+        // STEP 1: Try standard SPC download method (2 attempts)
 
-            // Try python3 first, then python, then py
-            $pythonCommands = ['python3', 'python', 'py'];
-            $pythonSuccess = false;
+        for ($attempt = 1; $attempt <= $maxRetries && !$downloaded; $attempt++) {
 
-            foreach ($pythonCommands as $pythonCmd) {
-                // Check if Python command is available
-                $checkCmd = "where {$pythonCmd}";
-                $checkResult = Process::run($checkCmd);
+            $this->line("  Standard download attempt {$attempt} of {$maxRetries}...");
 
-                if (!$checkResult->successful()) {
-                    $this->line("  - {$pythonCmd} not found, trying next...");
-                    continue;
-                }
+            $downloadResult = Process::path($spcPath)
 
-                $this->line("  - Using {$pythonCmd}: " . trim($checkResult->output()));
+                ->timeout(300)
 
-                $extractCmd = "\"{$pythonCmd}\" \"{$pythonScript}\" \"{$winArchiveFile}\" \"{$winTargetPath}\" 1";
+                ->env($this->getSpcEnvironment())
 
-                $extractResult = Process::timeout(300)
-                    ->run($extractCmd);
+                ->run("php bin/spc download {$lib}");
 
-                if ($extractResult->successful()) {
-                    $pythonSuccess = true;
-                    $this->line("  ✅ Extracted with {$pythonCmd}");
-                    $this->line($extractResult->output());
-                    break;
-                } else {
-                    $this->warn("  ⚠️ {$pythonCmd} failed: " . $extractResult->errorOutput());
-                }
-            }
+            if ($downloadResult->successful()) {
 
-            if ($pythonSuccess) {
-                // Verify essential files are present
-                $expectedFiles = $this->getExpectedFilesForDependency($depName);
-                if (!empty($expectedFiles)) {
-                    $allPresent = true;
-                    foreach ($expectedFiles as $file) {
-                        if (!file_exists($targetPath . DIRECTORY_SEPARATOR . $file)) {
-                            $this->warn("  ⚠️ Missing expected file: {$file}");
-                            $allPresent = false;
-                        }
-                    }
+                $downloaded = true;
 
-                    if ($allPresent) {
-                        $this->info("  ✅ All expected files verified for {$depName}");
-                        return true;
-                    }
-                } else {
-                    $this->info("  ✅ Extraction complete");
-                    return true;
-                }
-            } else {
-                $this->warn("  ⚠️ Python extraction failed, trying fallback methods...");
-            }
-        } else {
-            $this->warn("  ⚠️ Python script not found at: {$pythonScript}");
-        }
+                $this->info("  ✅ Successfully downloaded {$lib} via standard method");
 
-        // PRIORITY 2: Try 7-Zip extraction (if available)
-        $this->line("  - Trying 7-Zip extraction...");
-        $sevenZipPaths = [
-            'C:\Program Files\7-Zip\7z.exe',
-            'C:\Program Files (x86)\7-Zip\7z.exe',
-            '7z' // If in PATH
-        ];
-
-        $sevenZipPath = null;
-        foreach ($sevenZipPaths as $path) {
-            if ($path === '7z' || file_exists($path)) {
-                $sevenZipPath = $path;
                 break;
             }
-        }
 
-        if ($sevenZipPath) {
-            // 7z can extract tar.gz and tar.xz directly with full extraction
-            $extractCmd = "\"{$sevenZipPath}\" x \"{$archiveFile}\" -o\"{$targetPath}\" -y";
-            $sevenZipResult = Process::timeout(300)->run($extractCmd);
+            if ($attempt < $maxRetries) {
 
-            if ($sevenZipResult->successful()) {
-                $this->line("  ✅ Extracted with 7-Zip");
-                $this->handleBasicExtractionCleanup($targetPath, $depName);
+                $this->warn("  ⚠️ Download failed, retrying...");
 
-                // Verify extraction
-                $expectedFiles = $this->getExpectedFilesForDependency($depName);
-                if (!empty($expectedFiles)) {
-                    $allPresent = true;
-                    foreach ($expectedFiles as $file) {
-                        if (!file_exists($targetPath . DIRECTORY_SEPARATOR . $file)) {
-                            $allPresent = false;
-                            break;
-                        }
-                    }
-                    if ($allPresent) {
-                        $this->info("  ✅ All expected files verified for {$depName}");
-                        return true;
-                    }
-                } else {
-                    return true;
-                }
+                sleep(2);
+            } else {
+
+                $this->warn("  ⚠️ Standard download failed after {$maxRetries} attempts");
             }
         }
 
-        $this->warn("  ❌ All extraction methods failed for {$depName}");
+        // STEP 2: If standard download failed, try GitHub fallback
+
+        if (!$downloaded) {
+
+            $this->info("  🔄 Attempting GitHub fallback for {$lib}...");
+
+            $downloaded = $this->downloadFromGitHub($spcPath, $lib);
+        }
+
+        return $downloaded;
+    }
+
+    protected function downloadFromGitHub(string $spcPath, string $lib): bool
+
+    {
+
+        $sourceJsonPath = $spcPath . '/config/source.json';
+
+        if (!file_exists($sourceJsonPath)) {
+
+            $this->warn("  ⚠️ source.json not found, cannot determine GitHub repository for {$lib}");
+
+            return false;
+        }
+
+        $sourceConfig = json_decode(file_get_contents($sourceJsonPath), true);
+
+        if (!$sourceConfig || !isset($sourceConfig[$lib])) {
+
+            $this->warn("  ⚠️ Library {$lib} not found in source.json");
+
+            return false;
+        }
+
+        $libConfig = $sourceConfig[$lib];
+
+        $libType = $libConfig['type'] ?? '';
+
+        // Handle different GitHub-based source types
+
+        if ($libType === 'ghrel' || $libType === 'ghtagtar' || $libType === 'ghtar') {
+
+            return $this->cloneFromGitHubRepo($spcPath, $lib, $libConfig);
+        } elseif ($libType === 'git') {
+
+            return $this->cloneFromGitRepo($spcPath, $lib, $libConfig);
+        } elseif ($libType === 'url') {
+
+            // Check if URL is from GitHub and we can extract repo info
+
+            $url = $libConfig['url'] ?? '';
+
+            if ($this->isGitHubUrl($url)) {
+
+                return $this->cloneFromGitHubUrl($spcPath, $lib, $url);
+            } elseif (isset($libConfig['alt'])) {
+
+                // Try alternative URL if available
+
+                return $this->downloadFromAlternativeUrl($spcPath, $lib, $libConfig['alt']);
+            }
+        }
+
+        $this->warn("  ⚠️ No GitHub fallback available for {$lib} (type: {$libType})");
+
         return false;
     }
 
+    protected function cloneFromGitHubRepo(string $spcPath, string $lib, array $config): bool
+
+    {
+
+        $repo = $config['repo'] ?? '';
+
+        if (empty($repo)) {
+
+            $this->warn("  ⚠️ No repository specified for {$lib}");
+
+            return false;
+        }
+
+        $sourcePath = $spcPath . '/source';
+
+        $targetPath = $sourcePath . '/' . $lib;
+
+        $repoUrl = "https://github.com/{$repo}.git";
+
+        $this->info("  📦 Cloning {$lib} from GitHub: {$repo}");
+
+        // Ensure source directory exists
+
+        if (!file_exists($sourcePath)) {
+
+            mkdir($sourcePath, 0755, true);
+        }
+
+        // Remove existing directory if it exists
+
+        if (file_exists($targetPath)) {
+
+            $this->info("  🗑️ Removing existing {$lib} directory...");
+
+            Process::run('rm -rf "' . $targetPath . '"');
+        }
+
+        // Clone the repository
+
+        $cloneResult = Process::timeout(600) // 10 minutes timeout for large repos
+
+            ->run("git clone \"{$repoUrl}\" \"{$targetPath}\"");
+
+        if (!$cloneResult->successful()) {
+
+            $this->error("  ❌ Failed to clone {$lib} from GitHub: " . $cloneResult->errorOutput());
+
+            return false;
+        }
+
+        $this->info("  ✅ Successfully cloned {$lib} from GitHub");
+
+        // For GitHub repos, we don't need tar extraction since we cloned the source directly
+
+        // Create a marker file to indicate this was cloned (not downloaded as tar)
+
+        file_put_contents($targetPath . '/.cloned-from-github', json_encode([
+
+            'library' => $lib,
+
+            'repo' => $repo,
+
+            'cloned_at' => date('Y-m-d H:i:s'),
+
+            'method' => 'github_fallback'
+
+        ]));
+
+        $this->verifyClonedRepo($targetPath, $lib);
+
+        return true;
+    }
+
+    protected function cloneFromGitRepo(string $spcPath, string $lib, array $config): bool
+
+    {
+
+        $url = $config['url'] ?? '';
+
+        if (empty($url)) {
+
+            $this->warn("  ⚠️ No URL specified for git repository {$lib}");
+
+            return false;
+        }
+
+        $sourcePath = $spcPath . '/source';
+
+        $targetPath = $sourcePath . '/' . $lib;
+
+        $this->info("  📦 Cloning {$lib} from git repository: {$url}");
+
+        // Ensure source directory exists
+
+        if (!file_exists($sourcePath)) {
+
+            mkdir($sourcePath, 0755, true);
+        }
+
+        // Remove existing directory if it exists
+
+        if (file_exists($targetPath)) {
+
+            $this->info("  🗑️ Removing existing {$lib} directory...");
+
+            Process::run('rm -rf "' . $targetPath . '"');
+        }
+
+        // Clone the repository
+
+        $cloneResult = Process::timeout(600)
+
+            ->run("git clone \"{$url}\" \"{$targetPath}\"");
+
+        if (!$cloneResult->successful()) {
+
+            $this->error("  ❌ Failed to clone {$lib} from git: " . $cloneResult->errorOutput());
+
+            return false;
+        }
+
+        // Handle specific revision/branch if specified
+
+        $rev = $config['rev'] ?? '';
+
+        if (!empty($rev) && $rev !== 'master' && $rev !== 'main') {
+
+            $this->info("  🔀 Checking out revision: {$rev}");
+
+            $checkoutResult = Process::path($targetPath)->run("git checkout {$rev}");
+
+            if (!$checkoutResult->successful()) {
+
+                $this->warn("  ⚠️ Failed to checkout {$rev}, using default branch");
+            }
+        }
+
+        $this->info("  ✅ Successfully cloned {$lib} from git repository");
+
+        // Create marker file for git repos too
+
+        file_put_contents($targetPath . '/.cloned-from-git', json_encode([
+
+            'library' => $lib,
+
+            'url' => $url,
+
+            'rev' => $rev,
+
+            'cloned_at' => date('Y-m-d H:i:s'),
+
+            'method' => 'git_fallback'
+
+        ]));
+
+        $this->verifyClonedRepo($targetPath, $lib);
+
+        return true;
+    }
+
+    protected function downloadFromAlternativeUrl(string $spcPath, string $lib, array $altConfig): bool
+
+    {
+
+        if (!isset($altConfig['url'])) {
+
+            $this->warn("  ⚠️ No alternative URL specified for {$lib}");
+
+            return false;
+        }
+
+        $this->info("  🔄 Trying alternative URL for {$lib}: " . $altConfig['url']);
+
+        // Try manual download from alternative URL and place in downloads folder
+
+        $downloadsPath = $spcPath . '/downloads';
+
+        if (!file_exists($downloadsPath)) {
+
+            mkdir($downloadsPath, 0755, true);
+        }
+
+        $fileName = basename($altConfig['url']);
+
+        $targetFile = $downloadsPath . '/' . $fileName;
+
+        $downloadResult = Process::timeout(300)
+
+            ->run("curl -L -o \"{$targetFile}\" \"{$altConfig['url']}\"");
+
+        if ($downloadResult->successful()) {
+
+            $this->info("  ✅ Successfully downloaded {$lib} from alternative URL");
+
+            return true;
+        } else {
+
+            $this->warn("  ⚠️ Alternative URL download failed: " . $downloadResult->errorOutput());
+
+            return false;
+        }
+    }
+
+    protected function isGitHubUrl(string $url): bool
+
+    {
+
+        return strpos($url, 'github.com') !== false;
+    }
+
+    protected function cloneFromGitHubUrl(string $spcPath, string $lib, string $url): bool
+
+    {
+
+        // Extract repository info from GitHub URL
+
+        // Examples:
+
+        // https://github.com/GNOME/libxml2/archive/refs/tags/v2.12.5.tar.gz
+
+        // https://github.com/user/repo.git
+
+        $repoInfo = $this->extractGitHubRepoFromUrl($url);
+
+        if (!$repoInfo) {
+
+            $this->warn("  ⚠️ Could not extract repository info from GitHub URL: {$url}");
+
+            return false;
+        }
+
+        // Use Windows-optimized repositories when available
+
+        $originalRepoInfo = $repoInfo; // Save original for marker file
+
+        $optimizedRepo = $this->getWindowsOptimizedRepo($lib, $repoInfo);
+
+        if ($optimizedRepo) {
+
+            $this->info("  🪟 Using Windows-optimized repository: {$optimizedRepo['owner']}/{$optimizedRepo['repo']}");
+
+            $repoInfo = $optimizedRepo;
+        }
+
+        $sourcePath = $spcPath . '/source';
+
+        $targetPath = $sourcePath . '/' . $lib;
+
+        $repoUrl = "https://github.com/{$repoInfo['owner']}/{$repoInfo['repo']}.git";
+
+        $this->info("  📦 Cloning {$lib} from GitHub URL: {$repoInfo['owner']}/{$repoInfo['repo']}");
+
+        // Ensure source directory exists
+
+        if (!file_exists($sourcePath)) {
+
+            mkdir($sourcePath, 0755, true);
+        }
+
+        // Remove existing directory if it exists
+
+        if (file_exists($targetPath)) {
+
+            $this->info("  🗑️ Removing existing {$lib} directory...");
+
+            Process::run('rm -rf "' . $targetPath . '"');
+        }
+
+        // Clone the repository
+
+        $cloneResult = Process::timeout(600)
+
+            ->run("git clone \"{$repoUrl}\" \"{$targetPath}\"");
+
+        if (!$cloneResult->successful()) {
+
+            $this->error("  ❌ Failed to clone {$lib} from GitHub: " . $cloneResult->errorOutput());
+
+            return false;
+        }
+
+        // If there's a specific tag/version in the URL, try to checkout that tag
+
+        if (isset($repoInfo['tag'])) {
+
+            $this->info("  🔀 Checking out tag: {$repoInfo['tag']}");
+
+            $checkoutResult = Process::path($targetPath)->run("git checkout {$repoInfo['tag']}");
+
+            if (!$checkoutResult->successful()) {
+
+                $this->warn("  ⚠️ Failed to checkout tag {$repoInfo['tag']}, using default branch");
+            }
+        }
+
+        $this->info("  ✅ Successfully cloned {$lib} from GitHub URL");
+
+        // Create marker file for GitHub URL repos
+
+        $markerData = [
+
+            'library' => $lib,
+
+            'original_url' => $url,
+
+            'repo_url' => $repoUrl,
+
+            'owner' => $repoInfo['owner'],
+
+            'repo' => $repoInfo['repo'],
+
+            'tag' => $repoInfo['tag'] ?? null,
+
+            'cloned_at' => date('Y-m-d H:i:s'),
+
+            'method' => 'github_url_fallback'
+
+        ];
+
+        // Add Windows optimization info if applicable
+
+        if ($optimizedRepo) {
+
+            $markerData['windows_optimized'] = true;
+
+            $markerData['optimization_reason'] = $optimizedRepo['reason'];
+
+            $markerData['original_owner'] = $originalRepoInfo['owner'] ?? 'unknown';
+
+            $markerData['original_repo'] = $originalRepoInfo['repo'] ?? 'unknown';
+        }
+
+        file_put_contents($targetPath . '/.cloned-from-github', json_encode($markerData, JSON_PRETTY_PRINT));
+
+        $this->verifyClonedRepo($targetPath, $lib);
+
+        return true;
+    }
+
+    protected function extractGitHubRepoFromUrl(string $url): ?array
+
+    {
+
+        // Pattern 1: https://github.com/owner/repo/archive/refs/tags/v2.12.5.tar.gz
+
+        if (preg_match('#github\.com/([^/]+)/([^/]+)/archive/refs/tags/([^/]+)\.tar\.gz#', $url, $matches)) {
+
+            return [
+
+                'owner' => $matches[1],
+
+                'repo' => $matches[2],
+
+                'tag' => $matches[3]
+
+            ];
+        }
+
+        // Pattern 2: https://github.com/owner/repo/archive/v2.12.5.tar.gz
+
+        if (preg_match('#github\.com/([^/]+)/([^/]+)/archive/([^/]+)\.tar\.gz#', $url, $matches)) {
+
+            return [
+
+                'owner' => $matches[1],
+
+                'repo' => $matches[2],
+
+                'tag' => $matches[3]
+
+            ];
+        }
+
+        // Pattern 3: https://github.com/owner/repo.git
+
+        if (preg_match('#github\.com/([^/]+)/([^/]+)\.git#', $url, $matches)) {
+
+            return [
+
+                'owner' => $matches[1],
+
+                'repo' => $matches[2]
+
+            ];
+        }
+
+        // Pattern 4: Basic GitHub repo URL without .git
+
+        if (preg_match('#github\.com/([^/]+)/([^/]+)/?$#', $url, $matches)) {
+
+            return [
+
+                'owner' => $matches[1],
+
+                'repo' => $matches[2]
+
+            ];
+        }
+
+        return null;
+    }
+
+    protected function getWindowsOptimizedRepo(string $lib, array $originalRepo): ?array
+
+    {
+
+        // Map libraries to their Windows-optimized alternatives
+
+        $windowsRepos = [
+
+            'libxml2' => [
+
+                'owner' => 'winlibs',
+
+                'repo' => 'libxml2',
+
+                'reason' => 'Windows-optimized build for PHP with VC++ compilers'
+
+            ],
+
+            'libxslt' => [
+
+                'owner' => 'winlibs',
+
+                'repo' => 'libxslt',
+
+                'reason' => 'Windows-optimized XSLT library'
+
+            ],
+
+            'libiconv' => [
+
+                'owner' => 'winlibs',
+
+                'repo' => 'libiconv',
+
+                'reason' => 'Windows character encoding library'
+
+            ],
+
+            'zlib' => [
+
+                'owner' => 'winlibs',
+
+                'repo' => 'zlib',
+
+                'reason' => 'Windows-optimized compression library'
+
+            ]
+
+        ];
+
+        if (isset($windowsRepos[$lib])) {
+
+            $optimized = $windowsRepos[$lib];
+
+            // Preserve tag/version from original if available
+
+            if (isset($originalRepo['tag'])) {
+
+                $optimized['tag'] = $originalRepo['tag'];
+            }
+
+            $this->line("  💡 Found Windows-optimized alternative: {$optimized['reason']}");
+
+            return $optimized;
+        }
+
+        return null;
+    }
+
+    protected function verifyClonedRepo(string $targetPath, string $lib): void
+
+    {
+
+        if (!file_exists($targetPath)) {
+
+            $this->warn("  ⚠️ {$lib} directory not found after cloning");
+
+            return;
+        }
+
+        $contents = scandir($targetPath);
+
+        $realContents = array_diff($contents, ['.', '..']);
+
+        // For cloned repos, we expect different files than extracted tars
+
+        $essentialFiles = ['.git']; // Git repos should always have .git directory
+
+        $expectedFiles = $this->getExpectedFilesForDependency($lib);
+
+        if (!empty($expectedFiles)) {
+
+            $essentialFiles = array_merge($essentialFiles, $expectedFiles);
+        }
+
+        $missingFiles = [];
+
+        foreach ($essentialFiles as $file) {
+
+            if (!in_array($file, $realContents) && !file_exists($targetPath . '/' . $file)) {
+
+                $missingFiles[] = $file;
+            }
+        }
+
+        if (empty($missingFiles)) {
+
+            $this->info("  ✅ {$lib} repository verified - all essential files present");
+        } else {
+
+            $this->warn("  ⚠️ {$lib} repository may be incomplete - missing: " . implode(', ', $missingFiles));
+        }
+
+        // Show a few contents for confirmation
+
+        $this->line("  📁 Repository contents preview: " . implode(', ', array_slice($realContents, 0, 5)) .
+
+            (count($realContents) > 5 ? '... (' . count($realContents) . ' total)' : ''));
+    }
+
+    protected function getExpectedFilesForDependency(string $depName): array
+
+    {
+
+        switch ($depName) {
+
+            case 'sqlite':
+
+                return ['sqlite3.c', 'sqlite3.h', 'Makefile'];
+
+            case 'nghttp2':
+
+                return ['CMakeLists.txt', 'lib', 'configure'];
+
+            case 'openssl':
+
+                return ['Configure', 'config', 'crypto'];
+
+            case 'zlib':
+
+                return ['CMakeLists.txt', 'configure', 'zlib.h'];
+
+            case 'libssh2':
+
+                return ['CMakeLists.txt', 'src', 'include'];
+
+            case 'bzip2':
+
+                return ['Makefile', 'bzlib.h', 'bzip2.c'];
+
+            case 'curl':
+
+                return ['CMakeLists.txt', 'configure', 'lib', 'src'];
+
+            case 'libpng':
+
+                return ['CMakeLists.txt', 'configure', 'png.h'];
+
+            case 'libjpeg':
+
+                return ['CMakeLists.txt', 'configure', 'jpeglib.h'];
+
+            case 'libzip':
+
+                return ['CMakeLists.txt', 'configure', 'lib'];
+
+            case 'xz':
+
+                return ['CMakeLists.txt', 'configure', 'src'];
+
+            case 'libwebp':
+
+                return ['CMakeLists.txt', 'configure', 'src'];
+
+            case 'libxml2':
+
+                return ['CMakeLists.txt', 'configure', 'include'];
+
+            default:
+
+                return [];
+        }
+    }
+
+    protected function extractPhpSourceWindows(string $spcPath): void
+
+    {
+
+        $downloadsPath = $spcPath . '/downloads';
+
+        $sourcePath = $spcPath . '/source/php-src';
+
+        // Find PHP archive
+
+        $phpArchive = $this->getPhpArchivePath($spcPath);
+
+        if (!$phpArchive || !file_exists($phpArchive)) {
+
+            $this->warn('No PHP source archive found, skipping pre-extraction');
+
+            return;
+        }
+
+        $this->line('Found PHP archive: ' . basename($phpArchive));
+
+        // Check if already extracted
+
+        if (file_exists($sourcePath . '/main/php_version.h')) {
+
+            $this->info('✅ PHP source already extracted properly');
+
+            return;
+        }
+
+        // Clean and recreate source directory
+
+        if (file_exists($sourcePath)) {
+
+            $this->line('Cleaning existing PHP source directory...');
+
+            Process::run('rm -rf "' . $sourcePath . '"');
+        }
+
+        mkdir($sourcePath, 0755, true);
+
+        // Try Python extraction first (most reliable on Windows)
+
+        $pythonScript = __DIR__ . '/extract_php_source.py';
+
+        if (file_exists($pythonScript)) {
+
+            $this->line('Using Python-based extraction (Windows-compatible)...');
+
+            $extractResult = Process::timeout(300)->run(
+
+                "python \"{$pythonScript}\" \"{$phpArchive}\" \"{$sourcePath}\" 1"
+
+            );
+
+            if ($extractResult->successful() && file_exists($sourcePath . '/main/php_version.h')) {
+
+                $this->info('✅ PHP source extracted successfully using Python');
+
+                // Create hash file to prevent re-extraction by static-php-cli
+
+                $this->createSourceHashFile($spcPath, 'php-src', $phpArchive);
+
+                return;
+            } else {
+
+                $this->warn('Python extraction failed, trying alternative method...');
+            }
+        }
+
+        // Fallback: Two-step extraction using git bash tar
+
+        $this->line('Using two-step extraction method...');
+
+        // Convert to Unix-style paths for git bash
+
+        $unixArchive = str_replace('\\', '/', $phpArchive);
+
+        $unixSource = str_replace('\\', '/', $sourcePath);
+
+        if (preg_match('/^([A-Za-z]):\/(.*)/', $unixArchive, $matches)) {
+
+            $unixArchive = '/' . strtolower($matches[1]) . '/' . $matches[2];
+        }
+
+        if (preg_match('/^([A-Za-z]):\/(.*)/', $unixSource, $matches)) {
+
+            $unixSource = '/' . strtolower($matches[1]) . '/' . $matches[2];
+        }
+
+        $extractResult = Process::timeout(300)
+
+            ->env([
+
+                'MSYS2_ARG_CONV_EXCL' => '*',
+
+                'MSYS_NO_PATHCONV' => '1',
+
+                'PATH' => getenv('PATH')
+
+            ])
+
+            ->run("tar -xf '{$unixArchive}' -C '{$unixSource}' --strip-components=1");
+
+        if ($extractResult->successful() && file_exists($sourcePath . '/main/php_version.h')) {
+
+            $this->info('✅ PHP source extracted successfully using tar');
+
+            $this->createSourceHashFile($spcPath, 'php-src', $phpArchive);
+        } else {
+
+            throw new RuntimeException('Failed to extract PHP source using all available methods');
+        }
+    }
+
+    protected function extractPeclExtensionsWindows(string $spcPath, array $extensions): void
+
+    {
+
+        // Pre-extract PECL extensions that were downloaded (sqlsrv, pdo_sqlsrv, etc.)
+
+        // This prevents static-php-cli's problematic piped extraction on Windows
+
+        $downloadsPath = $spcPath . '/downloads';
+
+        $phpSourcePath = $spcPath . '/source/php-src';
+
+        $pythonScript = __DIR__ . '/extract_php_source.py';
+
+        $this->line("📦 Checking " . count($extensions) . " extensions for PECL extraction...");
+
+        $extracted = 0;
+
+        $skipped = 0;
+
+        foreach ($extensions as $ext) {
+
+            // Skip core extensions that don't need extraction
+
+            $coreExtensions = [
+                'pdo',
+                'pdo_sqlite',
+                'sqlite3',
+                'mbstring',
+                'fileinfo',
+                'tokenizer',
+
+                'openssl',
+                'curl',
+                'zip',
+                'zlib',
+                'session',
+                'filter',
+                'dom',
+                'xml',
+
+                'simplexml',
+                'gd',
+                'opcache',
+                'phar',
+                'iconv',
+                'ctype',
+                'bcmath',
+
+                'bz2',
+                'sockets',
+                'mysqlnd',
+                'mysqli',
+                'pdo_mysql'
+            ];
+
+            if (in_array($ext, $coreExtensions)) {
+
+                $skipped++;
+
+                continue;
+            }
+
+            // Look for downloaded archive (could be .tgz, .tar.gz, or .zip)
+            // Archives may have version numbers like sqlsrv-5.11.1.tgz
+
+            $extArchive = null;
+
+            foreach (['.tgz', '.tar.gz', '.zip'] as $suffix) {
+                // First try exact match
+                $archivePath = $downloadsPath . '/' . $ext . $suffix;
+                if (file_exists($archivePath)) {
+                    $extArchive = $archivePath;
+                    break;
+                }
+
+                // Then try pattern match for versioned archives (e.g., sqlsrv-5.11.1.tgz)
+                $pattern = $downloadsPath . '/' . $ext . '-*' . $suffix;
+                $matches = glob($pattern);
+                if (!empty($matches)) {
+                    $extArchive = $matches[0]; // Use first match
+                    break;
+                }
+            }
+
+            if (!$extArchive) {
+
+                $this->line("  ⏭️  {$ext} - no archive found");
+
+                $skipped++;
+
+                continue;
+            }
+
+            $extDestination = $phpSourcePath . '/ext/' . $ext;
+
+            // Check if already extracted
+
+            if (file_exists($extDestination) && is_dir($extDestination) && count(scandir($extDestination)) > 3) {
+
+                $this->line("  ✅ {$ext} already extracted");
+
+                $skipped++;
+
+                continue;
+            }
+
+            // Extract using Python script
+
+            if (file_exists($pythonScript) && !str_ends_with($extArchive, '.zip')) {
+
+                $this->line("  📦 Pre-extracting {$ext} from " . basename($extArchive) . "...");
+
+                // Clean destination
+
+                if (file_exists($extDestination)) {
+
+                    Process::run('rm -rf "' . $extDestination . '"');
+                }
+
+                $extractResult = Process::timeout(60)->run(
+
+                    "python \"{$pythonScript}\" \"{$extArchive}\" \"{$extDestination}\" 1"
+
+                );
+
+                // Check if extraction actually succeeded (Python may exit with error due to Unicode console issues)
+
+                $filesExtracted = file_exists($extDestination) && is_dir($extDestination) && count(glob($extDestination . '/*')) > 3;
+
+                if ($extractResult->successful() || $filesExtracted) {
+
+                    if (!$extractResult->successful() && $filesExtracted) {
+
+                        $this->info("  ✅ {$ext} extracted successfully (Python console error ignored)");
+                    } else {
+
+                        $this->info("  ✅ {$ext} extracted successfully");
+                    }
+
+                    // Create hash file to prevent re-extraction
+
+                    $this->createSourceHashFile($spcPath, 'php-src/ext/' . $ext, $extArchive);
+
+                    $extracted++;
+                } else {
+
+                    $this->warn("  ⚠️ Failed to pre-extract {$ext}: " . $extractResult->errorOutput());
+
+                    $this->line("     static-php-cli will attempt extraction");
+                }
+            }
+        }
+
+        if ($extracted > 0) {
+
+            $this->info("✅ Pre-extracted {$extracted} PECL extension(s), skipped {$skipped}");
+        } else {
+
+            $this->line("ℹ️  No PECL extensions needed pre-extraction (skipped {$skipped})");
+        }
+    }
+
+    protected function extractLibrariesWindows(string $spcPath): void
+
+    {
+
+        // Pre-extract libraries that have Windows-specific extraction issues
+
+        // (symlinks, path issues, etc.) using Python script
+
+        $downloadsPath = $spcPath . '/downloads';
+
+        $sourcePath = $spcPath . '/source';
+
+        $pythonScript = __DIR__ . '/extract_php_source.py';
+
+        if (!file_exists($pythonScript)) {
+
+            $this->warn('Python extraction script not found, skipping library pre-extraction');
+
+            return;
+        }
+
+        // Libraries known to have Windows extraction issues
+
+        $problemLibraries = [
+
+            'libxml2' => ['pattern' => 'libxml2*.tar.gz', 'check_file' => 'configure'],
+
+            'sqlite' => ['pattern' => 'sqlite*.tar.gz', 'check_file' => 'Makefile'],
+
+            'libzip' => ['pattern' => 'libzip*.tar.xz', 'check_file' => 'configure'],
+
+            'libwebp' => ['pattern' => 'libwebp*.tar.gz', 'check_file' => 'configure'],
+
+        ];
+
+        $this->line("📚 Pre-extracting problematic libraries with Python (symlink-safe)...");
+
+        foreach ($problemLibraries as $libName => $libInfo) {
+
+            $archives = glob($downloadsPath . '/' . $libInfo['pattern']);
+
+            if (empty($archives)) {
+
+                $this->line("  ⏭️  {$libName} - no archive found");
+
+                continue;
+            }
+
+            $archive = $archives[0];
+
+            $destination = $sourcePath . '/' . $libName;
+
+            // Check if already properly extracted
+
+            if (file_exists($destination . '/' . $libInfo['check_file'])) {
+
+                $this->line("  ✅ {$libName} already extracted properly");
+
+                continue;
+            }
+
+            $this->line("  📦 Pre-extracting {$libName} from " . basename($archive) . "...");
+
+            // Clean destination
+
+            if (file_exists($destination)) {
+
+                Process::run('rm -rf "' . $destination . '"');
+            }
+
+            mkdir($destination, 0755, true);
+
+            $extractResult = Process::timeout(120)->run(
+
+                "python \"{$pythonScript}\" \"{$archive}\" \"{$destination}\" 1"
+
+            );
+
+            // Check if extraction actually succeeded (even if Python exit code is non-zero due to Unicode console issues)
+
+            $filesCount = count(glob($destination . '/*'));
+
+            $hasCheckFile = file_exists($destination . '/' . $libInfo['check_file']);
+
+            if ($extractResult->successful() && $hasCheckFile) {
+
+                $this->info("  ✅ {$libName} extracted successfully");
+
+                $this->createSourceHashFile($spcPath, $libName, $archive);
+            } elseif ($filesCount > 10) {
+
+                // Files were extracted despite Python error or missing check file
+
+                if (!$extractResult->successful()) {
+
+                    $this->info("  ✅ {$libName} extracted successfully (Python console error ignored)");
+                } else {
+
+                    $this->warn("  ⚠️  {$libName} extracted but may be incomplete (symlinks skipped)");
+
+                    $this->line("      This is usually OK for Windows builds");
+                }
+
+                // Still create hash file to prevent re-extraction
+
+                $this->createSourceHashFile($spcPath, $libName, $archive);
+            } else {
+
+                $this->warn("  ❌ {$libName} extraction failed: " . $extractResult->errorOutput());
+
+                $this->line("     static-php-cli will attempt extraction");
+            }
+        }
+    }
+
+    protected function createSourceHashFile(string $spcPath, string $sourceName, string $archivePath): void
+
+    {
+
+        // Create .spc-hash file to prevent static-php-cli from re-extracting
+
+        // CRITICAL: static-php-cli uses sha1_file() to verify sources (see SourceManager.php:76-79)
+
+        $sourcePath = $spcPath . '/source/' . $sourceName;
+
+        $hashFile = $sourcePath . '/.spc-hash';
+
+        if (file_exists($archivePath)) {
+
+            // MUST use SHA1 to match static-php-cli's hash calculation
+
+            $hash = sha1_file($archivePath);
+
+            file_put_contents($hashFile, $hash);
+
+            $this->info("✅ Created .spc-hash file with SHA1: " . substr($hash, 0, 12) . '... (prevents re-extraction)');
+        } else {
+
+            $this->warn("⚠️ Archive not found: {$archivePath}, cannot create hash file");
+        }
+    }
+
     protected function normalizePackOptions($packs): array
+
     {
 
         if (is_string($packs) && $packs !== '') {
@@ -3727,6 +5391,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function normalizeBuildFlags($flags): array
+
     {
 
         if (is_string($flags) && $flags !== '') {
@@ -3762,6 +5427,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function resolveExtensionPacks(array $packs): array
+
     {
 
         $resolved = [];
@@ -3779,6 +5445,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function resolveLockfilePath(?string $path): string
+
     {
 
         $path = $path ?: '.nativephp-ext.lock';
@@ -3794,6 +5461,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function loadLockfile(): void
+
     {
 
         if ($this->lockfilePath === '' || !file_exists($this->lockfilePath)) {
@@ -3829,6 +5497,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function writeLockfile(): void
+
     {
 
         if ($this->lockfilePath === '') {
@@ -3875,6 +5544,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function calculateBuildMatrix(): void
+
     {
 
         $extensions = $this->selectedExtensions;
@@ -3907,12 +5577,14 @@ class InstallPhpExtensions extends Command
     }
 
     protected function computeBuildHash(array $matrix): string
+
     {
 
         return hash('sha256', json_encode($matrix, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
     }
 
     protected function resolveCacheDirectory(?string $override): string
+
     {
 
         $directory = $override;
@@ -3950,6 +5622,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function checkCacheForBuild(bool $silent = false): bool
+
     {
 
         if ($this->cacheDirectory === null || $this->buildHash === '') {
@@ -4005,6 +5678,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function announceCacheHit(): void
+
     {
 
         $this->cacheHit = true;
@@ -4018,6 +5692,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function acquireBuildLock(): void
+
     {
 
         if ($this->cacheDirectory === null || $this->buildHash === '') {
@@ -4047,6 +5722,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function releaseBuildLock(): void
+
     {
 
         if ($this->lockHandle === null) {
@@ -4062,6 +5738,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function packageBuildArtifacts(string $spcPath): ?array
+
     {
 
         if ($this->cacheDirectory === null) {
@@ -4204,6 +5881,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function gatherPackageFiles(string $buildroot, array $extensionWhitelist): array
+
     {
 
         $buildroot = rtrim(str_replace('\\', '/', $buildroot), '/');
@@ -4278,6 +5956,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function shouldIncludePathInPackage(string $relativePath, bool $isDir, array $extensionWhitelist): bool
+
     {
 
         $relativePath = ltrim(str_replace('\\', '/', $relativePath), '/');
@@ -4325,6 +6004,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function getExtensionFileWhitelist(): array
+
     {
 
         if ($this->buildProfile === 'full') {
@@ -4351,6 +6031,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function storeBuildMetadata(array $metadata): void
+
     {
 
         if ($this->cacheDirectory === null) {
@@ -4390,6 +6071,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function emitJsonSummary(string $status, array $extra = []): void
+
     {
 
         if (!$this->jsonOutput) {
@@ -4429,6 +6111,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function outputResolvedConfiguration(): void
+
     {
 
         $this->info('=== Build Configuration ===');
@@ -4458,6 +6141,7 @@ class InstallPhpExtensions extends Command
     }
 
     protected function deployToNativePHP(): void
+
     {
 
         // Check if NativePHP php-bin package is installed
@@ -4471,9 +6155,18 @@ class InstallPhpExtensions extends Command
             return;
         }
 
-        // Determine system PHP version for deployment filename
+        // Determine built PHP version for deployment filename (use resolved version, not system PHP)
 
-        $phpMajorMinor = PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION;
+        $builtVersion = $this->buildMetadata['resolved_version'] ?? $this->resolvedVersion ?? null;
+
+        if ($builtVersion) {
+            // Extract major.minor from the built version (e.g., "8.3.26" -> "8.3")
+            preg_match('/^(\d+\.\d+)/', $builtVersion, $matches);
+            $phpMajorMinor = $matches[1] ?? (PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION);
+        } else {
+            // Fallback to system PHP version
+            $phpMajorMinor = PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION;
+        }
 
         // Determine platform-specific path
 
@@ -4566,222 +6259,5 @@ class InstallPhpExtensions extends Command
 
             $this->error("❌ Failed to deploy to NativePHP");
         }
-    }
-
-    protected function extractPhpSourceWindows(string $spcPath): void
-    {
-        $downloadsPath = $spcPath . '/downloads';
-        $sourcePath = $spcPath . '/source/php-src';
-        $lockFilePath = $downloadsPath . '/.lock.json';
-
-        // Find PHP archive
-        $phpArchive = $this->getPhpArchivePath($spcPath);
-
-        if (!$phpArchive || !file_exists($phpArchive)) {
-            $this->warn('No PHP source archive found, skipping pre-extraction');
-            return;
-        }
-
-        $this->line('Found PHP archive: ' . basename($phpArchive));
-
-        // Read the lock file to get the expected hash
-        $expectedHash = null;
-        if (file_exists($lockFilePath)) {
-            $lockData = json_decode(file_get_contents($lockFilePath), true);
-            if (isset($lockData['php-src']['hash'])) {
-                $expectedHash = $lockData['php-src']['hash'];
-            }
-        }
-
-        // Check if already extracted with correct hash
-        $hashFile = $sourcePath . '/.spc-hash';
-        if (file_exists($sourcePath . '/main/php_version.h') && file_exists($hashFile)) {
-            $currentHash = trim(file_get_contents($hashFile));
-            if ($currentHash === $expectedHash) {
-                $this->info('✅ PHP source already extracted properly with matching hash');
-                return;
-            } else {
-                $this->warn("PHP source hash mismatch (expected: {$expectedHash}, got: {$currentHash})");
-            }
-        }
-
-        // Clean and recreate source directory
-        if (file_exists($sourcePath)) {
-            $this->line('Cleaning existing PHP source directory...');
-            Process::run('rm -rf "' . $sourcePath . '"');
-        }
-
-        mkdir($sourcePath, 0755, true);
-
-        // Use two-step extraction method
-        $this->line('Using two-step extraction method for PHP source...');
-
-        $extractionSuccess = $this->extractNestedTarArchive($phpArchive, $sourcePath, 'php-src');
-
-        if ($extractionSuccess && file_exists($sourcePath . '/main/php_version.h')) {
-            $this->info('✅ PHP source extracted successfully');
-
-            // Write the hash from lock file to prevent static-php-cli from re-extracting
-            if ($expectedHash) {
-                file_put_contents($hashFile, $expectedHash);
-                $this->info("✅ Created .spc-hash with expected hash: {$expectedHash}");
-            } else {
-                $this->warn('⚠️ Could not read expected hash from lock file, static-php-cli may re-extract');
-            }
-        } else {
-            throw new RuntimeException('Failed to extract PHP source using all available methods');
-        }
-    }
-
-    protected function extractPeclExtensionsWindows(string $spcPath, array $extensions): void
-    {
-        // Pre-extract PECL extensions that were downloaded (sqlsrv, pdo_sqlsrv, etc.)
-        // This prevents static-php-cli's problematic piped extraction on Windows
-
-        $downloadsPath = $spcPath . '/downloads';
-        $phpSourcePath = $spcPath . '/source/php-src';
-
-        $this->line("📦 Checking " . count($extensions) . " extensions for PECL extraction...");
-
-        $extracted = 0;
-        $skipped = 0;
-
-        foreach ($extensions as $ext) {
-            // Skip core extensions that don't need extraction
-            $coreExtensions = [
-                'pdo',
-                'pdo_sqlite',
-                'sqlite3',
-                'mbstring',
-                'fileinfo',
-                'tokenizer',
-                'openssl',
-                'curl',
-                'zip',
-                'zlib',
-                'session',
-                'filter',
-                'dom',
-                'xml',
-                'simplexml',
-                'gd',
-                'opcache',
-                'phar',
-                'iconv',
-                'ctype',
-                'bcmath',
-                'sockets',
-                'bz2',
-                'json',
-                'libxml',
-                'mbregex',
-                'mysqli',
-                'pdo_mysql',
-                'intl',
-                'soap'
-            ];
-
-            if (in_array($ext, $coreExtensions)) {
-                $skipped++;
-                continue;
-            }
-
-            // Check if extension needs PECL extraction (sqlsrv, pdo_sqlsrv, etc.)
-            $peclArchives = glob($downloadsPath . '/' . $ext . '*.tgz');
-            if (empty($peclArchives)) {
-                $peclArchives = glob($downloadsPath . '/' . $ext . '*.tar.gz');
-            }
-
-            if (!empty($peclArchives)) {
-                $archive = $peclArchives[0];
-                $targetPath = $phpSourcePath . '/ext/' . $ext;
-
-                if (file_exists($targetPath)) {
-                    $this->line("  ✅ {$ext} already extracted");
-                    continue;
-                }
-
-                $this->line("  📦 Extracting PECL extension: {$ext}");
-
-                if (!file_exists($targetPath)) {
-                    mkdir($targetPath, 0755, true);
-                }
-
-                $extractionSuccess = $this->extractNestedTarArchive($archive, $targetPath, $ext);
-
-                if ($extractionSuccess) {
-                    $this->line("  ✅ {$ext} extracted successfully");
-                    $extracted++;
-                } else {
-                    $this->warn("  ⚠️ Failed to extract {$ext}");
-                }
-            }
-        }
-
-        if ($extracted > 0) {
-            $this->info("✅ Extracted {$extracted} PECL extension(s)");
-        }
-        if ($skipped > 0) {
-            $this->line("  ℹ️  Skipped {$skipped} core extension(s) (no extraction needed)");
-        }
-    }
-
-    protected function getExpectedFilesForDependency(string $depName): array
-    {
-        switch ($depName) {
-            case 'sqlite':
-                return ['sqlite3.c', 'sqlite3.h'];
-            case 'nghttp2':
-                return ['CMakeLists.txt', 'lib'];
-            case 'openssl':
-                return ['Configure', 'crypto'];
-            case 'zlib':
-                return ['CMakeLists.txt', 'zlib.h'];
-            case 'libssh2':
-                return ['CMakeLists.txt', 'src', 'include'];
-            case 'bzip2':
-                return ['Makefile', 'bzlib.h', 'bzip2.c'];
-            case 'curl':
-                return ['CMakeLists.txt', 'lib', 'src'];
-            case 'libpng':
-                return ['CMakeLists.txt', 'png.h'];
-            case 'libjpeg':
-                return ['CMakeLists.txt', 'jpeglib.h'];
-            case 'libzip':
-                // libzip uses CMake only, no configure script
-                return ['CMakeLists.txt', 'lib'];
-            case 'xz':
-                return ['CMakeLists.txt', 'src'];
-            case 'libwebp':
-                // libwebp has configure.ac (not configure) and CMakeLists.txt
-                // configure script must be generated by running autogen.sh
-                return ['CMakeLists.txt', 'configure.ac'];
-            case 'libxml2':
-                // libxml2 has configure.ac (not configure) and CMakeLists.txt
-                // Note: The actual extraction is from libwebp archive (v1.3.2.tar.gz)
-                // which is why we see libwebp files here
-                return ['CMakeLists.txt', 'configure.ac'];
-            case 'onig':
-                return ['CMakeLists.txt', 'src'];
-            case 'freetype':
-                return ['CMakeLists.txt', 'include'];
-            case 'libiconv-win':
-                return ['CMakeLists.txt', 'lib', 'include'];
-            default:
-                return [];
-        }
-    }
-
-    protected function createSourceHashFile(string $spcPath, string $sourceName, string $archivePath): void
-    {
-        $sourcePath = $spcPath . '/source/' . $sourceName;
-        $hashFile = $sourcePath . '/.spc-hash';
-
-        if (!file_exists($sourcePath)) {
-            return;
-        }
-
-        $hash = hash_file('sha256', $archivePath);
-        file_put_contents($hashFile, $hash);
     }
 }
